@@ -2,6 +2,10 @@ export interface Word {
   text: string;
   start: number;
   end: number;
+  /** After corrections: which of the line's original words this came from. */
+  src?: number;
+  /** Speech recognition wasn't sure of this word: worth checking. */
+  unsure?: boolean;
 }
 
 export interface Line {
@@ -12,6 +16,13 @@ export interface Line {
   next: number;
   text: string;
   words: Word[];
+  /** The line's text before the user corrected any words (keys their fixes). */
+  orig?: string;
+  /** The line's words before corrections, so they can be re-applied. */
+  base?: Word[];
+  /** A stand-in where someone sings but no words were heard (one "♪♪♪"
+   * word over the singing), to be typed in or deleted. */
+  hum?: boolean;
 }
 
 const LINE_TAG = /\[(\d+):(\d+(?:[.:]\d+)?)\]/g;

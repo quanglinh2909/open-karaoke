@@ -1,0 +1,18 @@
+# whisper.cpp (speech recognition) is built by whisper-rs-sys through CMake.
+# Two things make it crawl if left alone:
+#  - the `cmake` crate overwrites the per-config C/C++ flags without an
+#    optimisation level, so the "optimised" build is really unoptimised;
+#  - with MSVC, GGML_NATIVE does not turn on AVX2/FMA/F16C.
+# These are read by whisper-rs-sys's build script (it forwards CMAKE_* and
+# GGML_* variables) and apply to dev and release builds alike. AVX2 means a
+# 2013-or-newer x86-64 CPU (Haswell / Ryzen).
+[env]
+CMAKE_C_FLAGS_RELWITHDEBINFO = "/MD /O2 /Ob2 /DNDEBUG"
+CMAKE_CXX_FLAGS_RELWITHDEBINFO = "/MD /O2 /Ob2 /DNDEBUG /EHsc"
+CMAKE_C_FLAGS_RELEASE = "/MD /O2 /Ob2 /DNDEBUG"
+CMAKE_CXX_FLAGS_RELEASE = "/MD /O2 /Ob2 /DNDEBUG /EHsc"
+GGML_NATIVE = "OFF"
+GGML_AVX = "ON"
+GGML_AVX2 = "ON"
+GGML_FMA = "ON"
+GGML_F16C = "ON"

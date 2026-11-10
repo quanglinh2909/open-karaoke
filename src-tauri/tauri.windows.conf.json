@@ -10,6 +10,7 @@
         "minHeight": 680,
         "backgroundColor": "#0b0a10",
         "decorations": false,
+        "maximized": true,
         "shadow": true
       }
     ]

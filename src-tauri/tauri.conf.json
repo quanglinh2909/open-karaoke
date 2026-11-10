@@ -18,13 +18,15 @@
         "height": 860,
         "minWidth": 1024,
         "minHeight": 680,
+        "maximized": true,
         "backgroundColor": "#0b0a10",
         "titleBarStyle": "Overlay",
         "hiddenTitle": true
       }
     ],
     "security": {
-      "csp": "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost"
+      "csp": "default-src 'self'; img-src 'self' data: https:; media-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; font-src 'self' data:; connect-src 'self' ipc: http://ipc.localhost asset: http://asset.localhost",
+      "assetProtocol": { "enable": true, "scope": ["$APPCACHE/**"] }
     }
   },
   "bundle": {

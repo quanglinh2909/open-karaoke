@@ -48,7 +48,7 @@ function TakeCard() {
       setSaving(true);
       try {
         const path = await api.labExport();
-        toast("Take saved with your current settings", "success", { label: "Show", run: () => revealItemInDir(path) });
+        toast("Đã lưu bản thu với cài đặt hiện tại", "success", { label: "Xem", run: () => revealItemInDir(path) });
       } finally {
         setSaving(false);
       }
@@ -68,16 +68,16 @@ function TakeCard() {
   return (
     <div className="lab-card">
       <div className="lab-card-head">
-        <h3>Test take</h3>
+        <h3>Thu thử</h3>
         <span className="help" style={{ margin: 0 }}>
-          {recording ? "Recording…" : hasTake ? "Loop it and tweak the settings on the right" : "Up to 30 seconds"}
+          {recording ? "Đang thu…" : hasTake ? "Phát lặp và chỉnh cài đặt bên phải" : "Tối đa 30 giây"}
         </span>
       </div>
       <div className="take-row">
-        <button className={`rec-big ${recording ? "on" : ""}`} onClick={record} title={recording ? "Stop recording" : "Record a take"}>
+        <button className={`rec-big ${recording ? "on" : ""}`} onClick={record} title={recording ? "Dừng thu" : "Thu một đoạn"}>
           {recording ? <span className="sq" /> : <Mic />}
         </button>
-        <button className="play-btn" onClick={play} disabled={!hasTake || recording} title="Play the take through your settings">
+        <button className="play-btn" onClick={play} disabled={!hasTake || recording} title="Phát bản thu qua cài đặt của bạn">
           {playing ? <Pause /> : <Play style={{ marginLeft: 3 }} />}
         </button>
         <div className="take-time">
@@ -96,8 +96,8 @@ function TakeCard() {
             value={ab}
             onChange={setAb}
             options={[
-              { label: "With my settings", value: "tuned" },
-              { label: "Original", value: "original" },
+              { label: "Với cài đặt của tôi", value: "tuned" },
+              { label: "Gốc", value: "original" },
             ]}
           />
         </div>
@@ -109,12 +109,12 @@ function TakeCard() {
             if (playing) void api.labPlay(!looped);
           }}
         >
-          Loop {looped ? "on" : "off"}
+          Lặp {looped ? "bật" : "tắt"}
         </button>
         <button className="btn small" disabled={!hasTake || saving} onClick={save}>
-          {saving ? "Saving…" : "Save WAV"}
+          {saving ? "Đang lưu…" : "Lưu WAV"}
         </button>
-        <button className="btn small" title="Open recordings folder" onClick={() => run(async () => revealItemInDir(await api.recordingsDir()))}>
+        <button className="btn small" title="Mở thư mục bản thu" onClick={() => run(async () => revealItemInDir(await api.recordingsDir()))}>
           <Folder />
         </button>
       </div>
@@ -129,17 +129,17 @@ function DroneCard() {
   return (
     <div className="lab-card">
       <div className="lab-card-head">
-        <h3>Key drone</h3>
+        <h3>Hợp âm nền</h3>
         <button className={`toggle ${on ? "on" : ""}`} role="switch" aria-checked={on} onClick={() => setParam("drone", on ? 0 : 0.6)} />
       </div>
       <p className="help" style={{ marginTop: 0, marginBottom: 14 }}>
-        A soft {keyName(params.tune_key, params.tune_scale)} chord to sing against, so you can hear the autotune pull you into key.
+        Hợp âm {keyName(params.tune_key, params.tune_scale)} nhẹ để hát theo, giúp bạn nghe autotune kéo giọng vào tông.
       </p>
       <div className="two" style={{ marginBottom: 14 }}>
         <Select value={Math.round(params.tune_key)} options={NOTE_NAMES.map((n, i) => ({ label: n, value: i }))} onChange={(v) => setParam("tune_key", v)} />
         <Select value={Math.round(params.tune_scale)} options={SCALES.map((s, i) => ({ label: s.name, value: i }))} onChange={(v) => setParam("tune_scale", v)} />
       </div>
-      <ParamSlider name="drone" label="Drone level" min={0} max={1} format={(v) => (v < 0.01 ? "Off" : `${Math.round(v * 100)}%`)} />
+      <ParamSlider name="drone" label="Mức hợp âm nền" min={0} max={1} format={(v) => (v < 0.01 ? "Tắt" : `${Math.round(v * 100)}%`)} />
     </div>
   );
 }
@@ -167,19 +167,19 @@ export function VoiceLab() {
       <div className="stage-main lab-main">
         <div className="lab-head">
           <h1>
-            Voice <em>Lab</em>
+            Thử <em>giọng</em>
           </h1>
           <p>
-            Build your sound before you sing. Record a short take, loop it, and shape the autotune and effects until it sounds right, then
-            save it under <b>My presets</b> to use in any song.
+            Tạo chất giọng trước khi hát. Thu một đoạn ngắn, phát lặp và chỉnh autotune, hiệu ứng đến khi ưng ý, rồi
+            lưu vào <b>Mẫu của tôi</b> để dùng cho mọi bài.
           </p>
           <div className="chips" style={{ justifyContent: "flex-start" }}>
             <span className="chip">
               <span className={`dot ${inputError ? "warn" : "ok"}`} />
-              Mic <b>{inputError ? "unavailable" : (input ?? "—")}</b>
+              Mic <b>{inputError ? "không dùng được" : (input ?? "—")}</b>
             </span>
             <button className="chip" onClick={() => set({ settingsOpen: true })}>
-              Change audio devices
+              Đổi thiết bị âm thanh
             </button>
           </div>
         </div>

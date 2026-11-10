@@ -67,3 +67,62 @@ function dedupe(videos: Video[]): Video[] {
   const seen = new Set<string>();
   return videos.filter((v) => (seen.has(v.id) ? false : (seen.add(v.id), true)));
 }
+
+/** Bracketed extras in video titles: (Official MV), [Lyrics], 【MV】… */
+const BRACKETS = /\s*[([【［].*?[)\]】］]\s*/g;
+const TAGS = /\b(official\s+(music\s+)?(video|audio|mv)|lyrics?\s*video|lyrics?|m\/?v|audio|karaoke|visualizer|4k|hd)\b/gi;
+
+const clean = (s: string) =>
+  s
+    .replace(BRACKETS, " ")
+    .replace(TAGS, " ")
+    .replace(/\s{2,}/g, " ")
+    .replace(/^[\s|｜\-–—:]+|[\s|｜\-–—:]+$/g, "")
+    .trim();
+
+const cleanChannel = (c: string) =>
+  c
+    .replace(/\s*-\s*Topic$/i, "")
+    .replace(/VEVO$/i, "")
+    .replace(/\s*(Official|Channel)$/i, "")
+    .trim();
+
+/** Whether a title part names the channel's artist ("SƠN TÙNG M-TP" on "Sơn Tùng M-TP Official"). */
+function namesChannel(part: string, channel: string): boolean {
+  const a = norm(part).replace(/ /g, "");
+  const b = norm(channel).replace(/ /g, "");
+  return a.length >= 3 && b.length >= 3 && (a.includes(b) || b.includes(a));
+}
+
+/**
+ * A song from a YouTube search result. Titles come as "Artist - Title (…)",
+ * "Title | Artist | Official MV" or "Artist | Title | …"; the part that
+ * matches the channel name is the artist, and failing a split the channel
+ * is. The title and artist are what lyrics are looked up by.
+ */
+export function songFromVideo(v: Video): SongMeta {
+  const channel = cleanChannel(v.channel);
+  let title = v.title;
+  let artist = channel;
+  const dash = v.title.split(/\s+[-–—]\s+/);
+  const bar = v.title.split(/\s*[|｜]\s*/).filter((p) => clean(p));
+  const parts = dash.length >= 2 ? [dash[0], dash.slice(1).join(" - ")] : bar.length >= 2 ? bar.slice(0, 2) : null;
+  if (parts) {
+    // Usual order: "Artist - Title", but "Title | Artist".
+    let [who, what] = dash.length >= 2 ? parts : [parts[1], parts[0]];
+    if (namesChannel(what, channel) && !namesChannel(who, channel)) [who, what] = [what, who];
+    artist = clean(who) || channel;
+    title = what;
+  }
+  return {
+    id: v.id,
+    title: clean(title) || v.title,
+    artist,
+    album: "",
+    duration: v.duration ?? 0,
+    artwork: `https://i.ytimg.com/vi/${v.id}/hqdefault.jpg`,
+    year: null,
+    explicit: false,
+    video: v,
+  };
+}

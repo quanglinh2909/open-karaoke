@@ -17,6 +17,15 @@ export interface SongMeta {
   artwork: string | null;
   year: string | null;
   explicit: boolean;
+  /** Picked from a YouTube search: this video is the recording to sing. */
+  video?: Video;
+}
+
+/** A note of the original singer's melody: seconds in the recording, fractional MIDI. */
+export interface MelodyNote {
+  start: number;
+  end: number;
+  midi: number;
 }
 
 export interface Lyrics {
@@ -37,6 +46,27 @@ export interface KeyEstimate {
   tonic: number;
   minor: boolean;
   confidence: number;
+}
+
+/** A recording's lyric analysis in the backend queue. */
+export interface LyricJob {
+  source: string;
+  stage: "queued" | "listen" | "time" | "separate";
+  fraction: number;
+}
+
+/** A phrase Whisper heard in the separated vocal; word times are rough. */
+export interface HeardLine {
+  start: number;
+  end: number;
+  words: { text: string; start: number; end: number; p: number }[];
+}
+
+export interface WordTime {
+  start: number;
+  end: number;
+  /** Mean log-probability of the word's letters; near 0 = clearly heard. */
+  score: number;
 }
 
 export interface SongInfo {
@@ -66,6 +96,8 @@ export interface DeviceList {
   outputs: string[];
   defaultInput: string | null;
   defaultOutput: string | null;
+  /** Installed ASIO drivers (Windows). */
+  asio: string[];
 }
 
 export interface AudioStatus {
@@ -75,6 +107,22 @@ export interface AudioStatus {
   inputError: string | null;
   buffer: number | null;
   latencyMs: number;
+  exclusive: boolean;
+  exclusiveNote: string | null;
+  /** The ASIO driver in use, if any. */
+  asio: string | null;
+}
+
+/** Measured delay from singing to hearing yourself, by stage (ms). */
+export interface LatencyReport {
+  inputMs: number;
+  queueMs: number;
+  chainMs: number;
+  outputMs: number;
+  totalMs: number;
+  inBlockMs: number;
+  outBlockMs: number;
+  mic: boolean;
 }
 
 export interface Score {
@@ -114,8 +162,26 @@ export const api = {
     invoke<Lyrics>("get_lyrics", { artist: m.artist, title: m.title, album: m.album, duration: m.duration }),
   ytSearch: (query: string, limit = 10) => invoke<Video[]>("yt_search", { query, limit }),
   ytDownload: (id: string) => invoke<string>("yt_download", { id }),
+  /** The recording's video, picture only, up to 1080p (cached). */
+  ytDownloadVideo: (id: string) => invoke<string>("yt_download_video", { id }),
   songSeparate: (path: string, id: string, job: number) => invoke<SongInfo>("song_separate", { path, id, job }),
   stemsCached: (ids: string[]) => invoke<string[]>("stems_cached", { ids }),
+  /** Separated-vocal loudness every 50 ms; null until separation is done. */
+  vocalActivity: () => invoke<number[] | null>("vocal_activity"),
+  /** Forced alignment of romanized lyric words against the separated vocal. */
+  /** `windows`: where speech recognition heard each line [start, end] (seconds), or null. */
+  alignLyrics: (source: string, lines: string[][], windows: ([number, number] | null)[] = []) =>
+    invoke<(WordTime | null)[][]>("align_lyrics", { source, lines, windows }),
+  /** What the singer actually sings, heard by Whisper; `prompt` (the published lyrics) primes it. */
+  /** The original singer's melody, from the separated vocal (about a second, then cached). */
+  melodyNotes: (source: string) => invoke<MelodyNote[]>("melody_notes", { source }),
+  transcribeVocal: (source: string, prompt: string | null) => invoke<HeardLine[]>("transcribe_vocal", { source, prompt }),
+  /** Lyric analyses waiting or running for these recordings. */
+  lyricJobs: (sources: string[]) => invoke<LyricJob[]>("lyric_jobs", { sources }),
+  /** Stop a recording's lyric analysis (queued or running) so others go first. */
+  cancelLyrics: (source: string) => invoke<void>("cancel_lyrics", { source }),
+  /** Delete a recording's stems, download and analyses (close the song first). */
+  deleteSource: (source: string) => invoke<void>("delete_source", { source }),
   songVocalRemoval: (path: string) => invoke<SongInfo>("song_vocal_removal", { path }),
   songTransform: (semitones: number, tempo: number) => invoke<SongInfo>("song_transform", { semitones, tempo }),
   songUnload: () => invoke<void>("song_unload"),
@@ -124,9 +190,10 @@ export const api = {
   seek: (seconds: number) => invoke<void>("transport_seek", { seconds }),
   setParams: (params: [string, number][]) => invoke<string[]>("set_params", { params }),
   audioDevices: () => invoke<DeviceList>("audio_devices"),
-  audioOpen: (input: string | null, output: string | null, buffer: number | null) =>
-    invoke<AudioStatus>("audio_open", { input, output, buffer }),
+  audioOpen: (input: string | null, output: string | null, buffer: number | null, exclusive = false, asio: string | null = null) =>
+    invoke<AudioStatus>("audio_open", { input, output, buffer, exclusive, asio }),
   audioStatus: () => invoke<AudioStatus>("audio_status"),
+  audioLatency: () => invoke<LatencyReport>("audio_latency"),
   recordStart: (name: string) => invoke<string>("record_start", { name }),
   recordStop: () => invoke<string | null>("record_stop"),
   labRecord: () => invoke<void>("lab_record"),
@@ -158,8 +225,20 @@ export function onSeparateError(cb: (e: { job: number; message: string }) => voi
   return listen<{ job: number; message: string }>("separate://error", (e) => cb(e.payload));
 }
 
+export function onVideoProgress(cb: (p: { id: string; fraction: number }) => void) {
+  return listen<{ id: string; fraction: number }>("download://video-progress", (e) => cb(e.payload));
+}
+
 export function onDownloadProgress(cb: (p: { id: string; fraction: number }) => void) {
   return listen<{ id: string; fraction: number }>("download://progress", (e) => cb(e.payload));
+}
+
+export function onAlignProgress(cb: (source: string, fraction: number) => void) {
+  return listen<{ source: string; fraction: number }>("align://progress", (e) => cb(e.payload.source, e.payload.fraction));
+}
+
+export function onTranscribeProgress(cb: (source: string, fraction: number) => void) {
+  return listen<{ source: string; fraction: number }>("transcribe://progress", (e) => cb(e.payload.source, e.payload.fraction));
 }
 
 export function errorText(e: unknown): string {

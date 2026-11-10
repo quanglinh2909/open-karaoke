@@ -36,7 +36,7 @@ fn ytdlp_asset() -> Result<&'static str, String> {
         ("windows", _) => "yt-dlp.exe",
         ("linux", "aarch64") => "yt-dlp_linux_aarch64",
         ("linux", _) => "yt-dlp_linux",
-        (os, arch) => return Err(format!("Unsupported platform {os}/{arch}")),
+        (os, arch) => return Err(format!("Không hỗ trợ nền tảng {os}/{arch}")),
     })
 }
 
@@ -48,7 +48,7 @@ fn deno_asset() -> Result<&'static str, String> {
         ("windows", _) => "deno-x86_64-pc-windows-msvc.zip",
         ("linux", "aarch64") => "deno-aarch64-unknown-linux-gnu.zip",
         ("linux", _) => "deno-x86_64-unknown-linux-gnu.zip",
-        (os, arch) => return Err(format!("Unsupported platform {os}/{arch}")),
+        (os, arch) => return Err(format!("Không hỗ trợ nền tảng {os}/{arch}")),
     })
 }
 
@@ -59,6 +59,33 @@ pub struct ToolStatus {
     pub ytdlp: bool,
     pub deno: bool,
     pub model: bool,
+}
+
+/// Put the tools and models a full installer ships (resources under
+/// `bundled/bin/`, laid out like the tools dir) in place if missing, so a
+/// fresh install needs no downloads. Hard links when possible (same drive:
+/// instant, no extra space), copies otherwise. Returns how many were added.
+pub fn adopt_bundled(resources: &Path, tools: &Path) -> usize {
+    fn walk(from: &Path, to: &Path, added: &mut usize) {
+        let Ok(entries) = std::fs::read_dir(from) else { return };
+        for entry in entries.flatten() {
+            let (src, dst) = (entry.path(), to.join(entry.file_name()));
+            if src.is_dir() {
+                walk(&src, &dst, added);
+            } else if !dst.exists() {
+                let _ = std::fs::create_dir_all(to);
+                let tmp = dst.with_extension("adopt");
+                let ok = std::fs::hard_link(&src, &dst).is_ok()
+                    || (std::fs::copy(&src, &tmp).is_ok() && std::fs::rename(&tmp, &dst).is_ok());
+                if ok {
+                    *added += 1;
+                }
+            }
+        }
+    }
+    let mut added = 0;
+    walk(&resources.join("bundled").join("bin"), tools, &mut added);
+    added
 }
 
 pub fn status(dir: &Path) -> ToolStatus {
@@ -90,13 +117,13 @@ async fn download(app: &AppHandle, url: &str, dest: &Path, step: &str, label: &s
         .send()
         .await
         .and_then(|r| r.error_for_status())
-        .map_err(|e| format!("Download failed ({label}): {e}"))?;
+        .map_err(|e| format!("Tải thất bại ({label}): {e}"))?;
     let total = resp.content_length().unwrap_or(0) as f64;
     let part = dest.with_extension("part");
     let mut file = tokio::fs::File::create(&part).await.map_err(|e| e.to_string())?;
     let mut done = 0f64;
     let mut last_emit = 0f64;
-    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Download interrupted ({label}): {e}"))? {
+    while let Some(chunk) = resp.chunk().await.map_err(|e| format!("Tải bị gián đoạn ({label}): {e}"))? {
         file.write_all(&chunk).await.map_err(|e| e.to_string())?;
         done += chunk.len() as f64;
         if total > 0.0 && (done - last_emit) / total > 0.01 {
@@ -126,20 +153,20 @@ pub async fn install(app: &AppHandle, dir: &Path) -> Result<ToolStatus, String> 
 
     if !ytdlp_path(dir).is_file() {
         let url = format!("https://github.com/yt-dlp/yt-dlp/releases/latest/download/{}", ytdlp_asset()?);
-        download(app, &url, &ytdlp_path(dir), "ytdlp", "Audio downloader (yt-dlp)").await?;
+        download(app, &url, &ytdlp_path(dir), "ytdlp", "Trình tải nhạc (yt-dlp)").await?;
         make_executable(&ytdlp_path(dir))?;
     }
 
     if !deno_path(dir).is_file() {
         let url = format!("https://github.com/denoland/deno/releases/latest/download/{}", deno_asset()?);
         let zip_path = dir.join("deno.zip");
-        download(app, &url, &zip_path, "deno", "JavaScript runtime (Deno)").await?;
+        download(app, &url, &zip_path, "deno", "Trình chạy JavaScript (Deno)").await?;
         let dir2 = dir.to_path_buf();
         let zp = zip_path.clone();
         tauri::async_runtime::spawn_blocking(move || -> Result<(), String> {
             let f = std::fs::File::open(&zp).map_err(|e| e.to_string())?;
             let mut archive = zip::ZipArchive::new(f).map_err(|e| e.to_string())?;
-            let mut entry = archive.by_name(&exe("deno")).map_err(|e| format!("Deno archive: {e}"))?;
+            let mut entry = archive.by_name(&exe("deno")).map_err(|e| format!("Gói Deno: {e}"))?;
             let tmp = deno_path(&dir2).with_extension("part");
             let mut out = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
             std::io::copy(&mut entry, &mut out).map_err(|e| e.to_string())?;
@@ -156,21 +183,46 @@ pub async fn install(app: &AppHandle, dir: &Path) -> Result<ToolStatus, String> 
         ensure_model(app, dir).await?;
     }
 
-    let _ = app.emit("setup://progress", SetupProgress { step: "done", label: "Ready", fraction: 1.0 });
+    let _ = app.emit("setup://progress", SetupProgress { step: "done", label: "Sẵn sàng", fraction: 1.0 });
     Ok(status(dir))
 }
 
 /// Download the separation model if missing, verifying its SHA-256.
 pub async fn ensure_model(app: &AppHandle, dir: &Path) -> Result<PathBuf, String> {
+    let model = &crate::audio::separate::MODEL;
+    ensure_verified(app, &model_path(dir), model.url, model.sha256, "model", "Mô hình AI tách giọng").await
+}
+
+/// Download the lyrics alignment model on first use (~320 MB).
+pub async fn ensure_align_model(app: &AppHandle, dir: &Path) -> Result<PathBuf, String> {
+    let model = &crate::audio::align::MODEL;
+    let path = dir.join("models").join(model.file);
+    ensure_verified(app, &path, model.url, model.sha256, "align-model", "Mô hình canh lời").await
+}
+
+/// Download the speech recognition model on first use (~550 MB).
+pub async fn ensure_whisper_model(app: &AppHandle, dir: &Path) -> Result<PathBuf, String> {
+    let model = &crate::audio::transcribe::MODEL;
+    let path = dir.join("models").join(model.file);
+    ensure_verified(app, &path, model.url, model.sha256, "whisper-model", "Mô hình nhận dạng giọng hát").await
+}
+
+/// Download the melody tracker on first use (~135 KB).
+pub async fn ensure_melody_model(app: &AppHandle, dir: &Path) -> Result<PathBuf, String> {
+    let model = &crate::audio::melody::MODEL;
+    let path = dir.join("models").join(model.file);
+    ensure_verified(app, &path, model.url, model.sha256, "melody-model", "Mô hình dò giai điệu").await
+}
+
+async fn ensure_verified(app: &AppHandle, path: &Path, url: &str, sha256: &str, step: &str, label: &str) -> Result<PathBuf, String> {
     use sha2::{Digest, Sha256};
-    let path = model_path(dir);
+    let path = path.to_path_buf();
     if path.is_file() {
         return Ok(path);
     }
-    let model = &crate::audio::separate::MODEL;
     tokio::fs::create_dir_all(path.parent().unwrap()).await.map_err(|e| e.to_string())?;
     let tmp = path.with_extension("download");
-    download(app, model.url, &tmp, "model", "AI vocal separation model").await?;
+    download(app, url, &tmp, step, label).await?;
     let check = tmp.clone();
     let digest = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
         let mut file = std::fs::File::open(&check).map_err(|e| e.to_string())?;
@@ -180,9 +232,9 @@ pub async fn ensure_model(app: &AppHandle, dir: &Path) -> Result<PathBuf, String
     })
     .await
     .map_err(|e| e.to_string())??;
-    if digest != model.sha256 {
+    if digest != sha256 {
         let _ = tokio::fs::remove_file(&tmp).await;
-        return Err("The downloaded AI model was corrupted. Please try again.".into());
+        return Err(format!("{label} tải về bị lỗi. Hãy thử lại."));
     }
     tokio::fs::rename(&tmp, &path).await.map_err(|e| e.to_string())?;
     Ok(path)

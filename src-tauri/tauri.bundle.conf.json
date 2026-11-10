@@ -1,0 +1,9 @@
+{
+  "bundle": {
+    "targets": ["nsis"],
+    "resources": { "bundled/bin/": "bundled/bin/" },
+    "windows": {
+      "nsis": { "compression": "none" }
+    }
+  }
+}

@@ -58,7 +58,14 @@ export const Mic = (p: SVGProps<SVGSVGElement>) => (
   </svg>
 );
 
-export const Panel = (p: SVGProps<SVGSVGElement>) => (
+export const MicOff = (p: SVGProps<SVGSVGElement>) => (
+  <svg {...base(p)}>
+    <rect x="9" y="3" width="6" height="11" rx="3" />
+    <path d="M5 11a7 7 0 0 0 14 0M12 18v3M9 21h6M4 4l16 16" />
+  </svg>
+);
+
+export const Panel =(p: SVGProps<SVGSVGElement>) => (
   <svg {...base(p)}>
     <rect x="3" y="4" width="18" height="16" rx="3" />
     <path d="M15 4v16" />

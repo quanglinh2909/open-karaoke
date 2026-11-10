@@ -1,11 +1,15 @@
+pub mod align;
 pub mod analysis;
 pub mod chain;
 pub mod decode;
 pub mod engine;
+pub mod exclusive;
 pub mod fx;
+pub mod melody;
 pub mod params;
 pub mod pitch;
 pub mod psola;
 pub mod scale;
 pub mod separate;
 pub mod stretch;
+pub mod transcribe;

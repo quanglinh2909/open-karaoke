@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+tauri = { version = "2", features = ["protocol-asset"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -33,6 +33,24 @@ crossbeam-channel = "0.5"
 hound = "3"
 signalsmith-stretch = "0.1"
 sha2 = "0.10"
+whisper-rs = "0.16"
+
+# WASAPI exclusive mode (low-latency singing); cpal only does shared mode.
+[target.'cfg(windows)'.dependencies]
+# ASIO (Steinberg) host, for drivers such as ASIO Link Pro or ASIO4ALL: the
+# low-latency path DAWs use. Building it needs the ASIO SDK (CPAL_ASIO_DIR).
+cpal = { version = "0.18", features = ["asio"] }
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Media_Audio",
+    "Win32_Media_KernelStreaming",
+    "Win32_Media_Multimedia",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Com_StructuredStorage",
+    "Win32_System_Threading",
+    "Win32_System_Variant",
+] }
 
 [profile.dev]
 # DSP code is far too slow unoptimised; keep debug builds usable for singing.
@@ -51,3 +69,8 @@ strip = true
 # for Intel Macs; there the app falls back to the basic vocal remover.
 [target.'cfg(not(all(target_os = "macos", target_arch = "x86_64")))'.dependencies]
 ort = { version = "=2.0.0-rc.15", default-features = false, features = ["std", "download-binaries", "tls-rustls", "copy-dylibs", "api-31"] }
+
+# Build scripts without debug assertions: whisper-rs-sys otherwise compiles
+# whisper.cpp with WHISPER_DEBUG, which logs every decoded token.
+[profile.dev.build-override]
+debug-assertions = false

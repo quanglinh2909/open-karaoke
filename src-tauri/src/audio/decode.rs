@@ -19,17 +19,17 @@ pub fn decode_file(path: &Path, target_sr: u32) -> Result<Vec<f32>, String> {
     }
     let probed = symphonia::default::get_probe()
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
-        .map_err(|e| format!("Unsupported audio format: {e}"))?;
+        .map_err(|e| format!("Định dạng âm thanh không hỗ trợ: {e}"))?;
     let mut format = probed.format;
     let track = format
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .ok_or("No audio track in file")?;
+        .ok_or("Tệp không có âm thanh")?;
     let track_id = track.id;
     let mut decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
-        .map_err(|e| format!("Unsupported codec: {e}"))?;
+        .map_err(|e| format!("Codec không hỗ trợ: {e}"))?;
     let mut src_sr = track.codec_params.sample_rate.unwrap_or(44_100);
 
     let mut left = Vec::new();
@@ -40,7 +40,7 @@ pub fn decode_file(path: &Path, target_sr: u32) -> Result<Vec<f32>, String> {
             Ok(p) => p,
             Err(SymError::IoError(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(SymError::ResetRequired) => break,
-            Err(e) => return Err(format!("Read error: {e}")),
+            Err(e) => return Err(format!("Lỗi đọc tệp: {e}")),
         };
         if packet.track_id() != track_id {
             continue;
@@ -48,7 +48,7 @@ pub fn decode_file(path: &Path, target_sr: u32) -> Result<Vec<f32>, String> {
         let decoded = match decoder.decode(&packet) {
             Ok(d) => d,
             Err(SymError::DecodeError(_)) => continue,
-            Err(e) => return Err(format!("Decode error: {e}")),
+            Err(e) => return Err(format!("Lỗi giải mã: {e}")),
         };
         let spec = *decoded.spec();
         src_sr = spec.rate;
@@ -65,7 +65,7 @@ pub fn decode_file(path: &Path, target_sr: u32) -> Result<Vec<f32>, String> {
         }
     }
     if left.is_empty() {
-        return Err("The audio file contained no samples".into());
+        return Err("Tệp âm thanh trống".into());
     }
 
     let (left, right) = if src_sr != target_sr {

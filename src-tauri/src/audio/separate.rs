@@ -179,8 +179,8 @@ impl Separator {
         let env = ort::init()
             .with_name("open-karaoke")
             .build()
-            .map_err(|e| format!("Could not start ONNX Runtime: {e}"))?;
-        let fail = |e: &dyn std::fmt::Display| format!("Could not load the vocal separation model: {e}");
+            .map_err(|e| format!("Không khởi động được ONNX Runtime: {e}"))?;
+        let fail = |e: &dyn std::fmt::Display| format!("Không tải được mô hình tách giọng: {e}");
         let session = Session::builder(&env)
             .map_err(|e| fail(&e))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -222,10 +222,10 @@ impl Separator {
     fn infer(&mut self, input: &[f32]) -> Result<Vec<f32>, String> {
         let cfg = self.cfg;
         let tensor = Tensor::from_array(([1usize, 4, cfg.dim_f, cfg.dim_t], input.to_vec())).map_err(|e| e.to_string())?;
-        let outputs = self.session.run(ort::inputs![tensor]).map_err(|e| format!("Separation failed: {e}"))?;
+        let outputs = self.session.run(ort::inputs![tensor]).map_err(|e| format!("Tách giọng thất bại: {e}"))?;
         let (_, out) = outputs[0].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
         if out.len() < 4 * cfg.dim_f * cfg.dim_t {
-            return Err("The separation model returned an unexpected shape".into());
+            return Err("Mô hình tách giọng trả về dữ liệu không đúng dạng".into());
         }
         Ok(out.to_vec())
     }
@@ -242,7 +242,7 @@ impl Separator {
         let (chunk, trim, step) = (cfg.chunk(), cfg.trim(), cfg.step());
         let frames = self.stft.frames(chunk);
         if frames != cfg.dim_t {
-            return Err(format!("Unexpected model shape: {} frames, model wants {}", frames, cfg.dim_t));
+            return Err(format!("Dữ liệu mô hình không đúng dạng: {} khung, mô hình cần {}", frames, cfg.dim_t));
         }
         let bins = self.stft.bins();
         let plane = cfg.dim_f * cfg.dim_t;
@@ -326,7 +326,7 @@ impl Separator {
     }
 }
 
-pub const UNAVAILABLE: &str = "AI separation isn't available on Intel Macs yet";
+pub const UNAVAILABLE: &str = "Chưa hỗ trợ tách giọng AI trên máy Mac chip Intel";
 
 // ------------------------------------------------------- growing buffer --
 

@@ -1,5 +1,7 @@
 <div align="center">
 
+
+
 <img src="docs/screenshots/banner-92906ff.jpg" alt="Open Karaoke: open-source karaoke with real-time autotune" width="100%" />
 
 # Open Karaoke

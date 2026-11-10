@@ -90,6 +90,9 @@ pub struct VocalChain {
     dbl_delay: [DelayLine; 2],
     voices: [f32; MAX_VOICES],
     level_env: f32,
+    /// 0 = voice through the pitch shifter, 1 = straight from the mic.
+    /// It glides between the two so switching doesn't click.
+    natural: f32,
 }
 
 impl VocalChain {
@@ -102,6 +105,7 @@ impl VocalChain {
             psola: Psola::new(fs),
             ctl: Controller::new(),
             lead_ratio: 1.0,
+            natural: 0.0,
             eq: Default::default(),
             deess: [DeEsser::new(fs), DeEsser::new(fs)],
             comp: Compressor::new(fs),
@@ -115,7 +119,11 @@ impl VocalChain {
 
     /// Processing latency of the chain in samples.
     pub fn latency(&self) -> usize {
-        self.psola.latency()
+        if self.natural > 0.5 {
+            0
+        } else {
+            self.psola.latency()
+        }
     }
 
     /// Process a block of mono microphone samples into interleaved stereo.
@@ -137,6 +145,17 @@ impl VocalChain {
         let (rv_mix, rv_size, rv_damp) = (p.reverb_mix.get(), p.reverb_size.get(), p.reverb_damp.get());
         let spread = p.harmony_spread.get().clamp(0.0, 1.0);
         self.detector.cutoff = 0.86;
+        // Nothing touches the pitch (no correction, shift, formant, vibrato,
+        // harmonies or doubling): skip the resynthesis, which colours the
+        // voice slightly and delays it, and pass the mic straight through.
+        let natural = p.tune_enabled.get() <= 0.5
+            && p.tune_transpose.get().abs() < 0.01
+            && p.tune_formant.get().abs() < 0.01
+            && p.tune_vibrato_depth.get() < 0.5
+            && p.harmony_a.get().abs() < 0.5
+            && p.harmony_b.get().abs() < 0.5
+            && p.doubler.get() < 0.01;
+        let natural_target = if natural { 1.0 } else { 0.0 };
 
         out.clear();
         out.reserve(input.len() * 2);
@@ -153,7 +172,10 @@ impl VocalChain {
 
             self.psola.process(x, &mut self.voices);
             let dry = self.psola.dry();
-            let lead = dry * (1.0 - mix) + self.voices[LEAD] * mix;
+            let shaped = dry * (1.0 - mix) + self.voices[LEAD] * mix;
+            // ~10 ms glide.
+            self.natural += (natural_target - self.natural) * (1.0 / (0.01 * fs));
+            let lead = x * self.natural + shaped * (1.0 - self.natural);
 
             // Harmonies and doubles are panned around the centred lead.
             let pan = |v: f32, pos: f32| (v * (0.5 - 0.5 * pos).sqrt(), v * (0.5 + 0.5 * pos).sqrt());

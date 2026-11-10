@@ -89,6 +89,7 @@ params! {
     guide = 0.0,
     vocal = 0.9,
     monitor = 1.0,
+    mic = 1.0, // 0 = mic switched off (nothing heard, scored or recorded)
     record_latency_ms = -1.0, // <0 = automatic
     drone = 0.0,          // Voice Lab key drone level
 }

@@ -348,6 +348,7 @@ select {
   background: transparent;
   transition: background 0.15s, transform 0.15s;
   position: relative;
+  cursor: pointer;
 }
 .card:hover {
   background: var(--raise);
@@ -460,6 +461,18 @@ select {
   filter: blur(80px) saturate(1.5);
   opacity: 0.38;
   transform: scale(1.1);
+}
+/* The recording's own video behind the lyrics: visible, but dimmed for them. */
+.stage-bg .stage-video {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  opacity: 0.6;
+}
+.stage-bg.video-on::after {
+  background: radial-gradient(ellipse at 50% 42%, rgba(11, 10, 16, 0.35) 0%, rgba(11, 10, 16, 0.6) 60%, var(--bg) 100%);
 }
 .stage-bg::after {
   content: "";
@@ -596,8 +609,71 @@ select {
   font-size: clamp(16px, 2vw, 24px);
   color: rgba(245, 242, 251, 0.2);
 }
-.lyric-line .w {
+/* Synced lyrics: every line on one track that glides up, so the line to
+   sing always sits at the same height and nothing resizes or reflows. */
+.lyrics.synced {
+  padding: 0;
+}
+.lyric-track {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0 48px;
+  transition: transform 0.6s cubic-bezier(0.22, 0.8, 0.3, 1);
+  will-change: transform;
+}
+.lyric-track .tl {
+  font-size: clamp(28px, 3.8vw, 52px);
+  margin: 0.16em 0;
+  opacity: 0;
+  transform: scale(0.72);
+  transition: opacity 0.45s, transform 0.6s cubic-bezier(0.22, 0.8, 0.3, 1);
+}
+.lyric-track .tl.d0 {
+  opacity: 1;
+  transform: none;
+}
+.lyric-track .tl.d1 {
+  opacity: 0.55;
+}
+.lyric-track .tl.d2 {
+  opacity: 0.25;
+}
+.lyric-track .tl.d0 .w {
+  background: linear-gradient(90deg, #ffffff 0%, #ffe0ec calc(var(--p) - 4%), rgba(245, 242, 251, 0.4) var(--p));
+  -webkit-background-clip: text;
+  background-clip: text;
+}
+.lyric-track .tl.intro {
+  margin-bottom: 0.6em;
+}
+/* Countdown and break panel, just above the line to sing. */
+.lyric-cue {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 58%;
+  padding-bottom: 12px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  pointer-events: none;
+}
+.lyric-cue .countdown {
+  margin: 0;
+}
+.lyric-cue .break-panel {
+  margin: 0 0 10px;
+}
+.lyric-line .word {
   --p: 0%;
+  --h: 0%;
+}
+.lyric-line .w {
   background: linear-gradient(90deg, #fff 0%, #ffd2e4 var(--p), rgba(245, 242, 251, 0.38) var(--p));
   -webkit-background-clip: text;
   background-clip: text;
@@ -611,6 +687,146 @@ select {
   background: linear-gradient(90deg, #ffffff 0%, #ffe0ec calc(var(--p) - 4%), rgba(245, 242, 251, 0.4) var(--p));
   -webkit-background-clip: text;
   background-clip: text;
+}
+/* Song tab: skipping an ad at either end. */
+.trim-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.trim-row .trim-label {
+  flex: 1;
+  font-size: 13px;
+  color: var(--muted);
+}
+.trim-row .stepper.small .val {
+  min-width: 52px;
+  font-size: 13px;
+}
+.transport .rail .trim-cut {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: repeating-linear-gradient(135deg, rgba(0, 0, 0, 0.55) 0 4px, rgba(255, 255, 255, 0.08) 4px 8px);
+  pointer-events: none;
+}
+/* Singing marks, drawn like a score: soft pink, glowing while they apply. */
+/* Held note: a tapering trail after the word that lights up as it is held. */
+.lyric-line .hold {
+  display: inline-block;
+  height: 0.09em;
+  margin-left: 0.14em;
+  vertical-align: 0.32em;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent) var(--h), rgba(255, 255, 255, 0.22) var(--h));
+  -webkit-mask-image: linear-gradient(90deg, #000 0%, #000 50%, transparent 100%);
+  mask-image: linear-gradient(90deg, #000 0%, #000 50%, transparent 100%);
+  filter: drop-shadow(0 0 6px rgba(255, 61, 127, 0.5));
+}
+/* Rests: a breath mark ’ (quick breath), a caesura // (real pause), a
+   tie ‿ at a line end that runs straight into the next line. */
+.lyric-line .rest {
+  display: inline-block;
+  margin: 0 0.04em 0 0.1em;
+  font-size: 0.62em;
+  font-weight: 600;
+  line-height: 1;
+  vertical-align: 0.42em;
+  color: rgba(255, 61, 127, 0.45);
+  transition: color 0.2s, text-shadow 0.2s;
+}
+.lyric-line .rest.short::before {
+  content: "’";
+}
+.lyric-line .rest.long::before {
+  content: "//";
+  letter-spacing: -0.1em;
+}
+.lyric-line .rest.link {
+  vertical-align: -0.05em;
+}
+.lyric-line .rest.link::before {
+  content: "‿";
+}
+.lyric-line .rest.on {
+  color: #ffd2e4;
+  text-shadow: 0 0 10px var(--accent), 0 0 18px var(--accent);
+}
+/* Entry glow before a line's first word: during a short gap it swells and
+   brightens like a breath in, fullest when it is time to sing. */
+.lyric-line .word {
+  position: relative;
+}
+.lyric-line .entry {
+  position: absolute;
+  left: -0.6em;
+  top: 52%;
+  width: 0.3em;
+  height: 0.3em;
+  margin-top: -0.15em;
+  border-radius: 50%;
+  background: radial-gradient(circle, #fff 0%, var(--accent) 50%, rgba(255, 61, 127, 0) 75%);
+  box-shadow: 0 0 calc(22px * var(--e, 0)) var(--accent);
+  transform: scale(calc(0.4 + 0.9 * var(--e, 0)));
+  opacity: 0;
+}
+.lyric-line .entry.show {
+  opacity: calc(0.35 + 0.65 * var(--e, 0));
+}
+/* What the marks mean, under the title before the first line. */
+.lyrics .legend {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 4px 20px;
+  margin-top: 18px;
+  font-family: var(--font-ui);
+  font-size: 12.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  color: rgba(245, 242, 251, 0.5);
+}
+.lyrics .legend b {
+  color: var(--accent);
+  font-weight: 700;
+  margin-right: 6px;
+  text-shadow: 0 0 8px rgba(255, 61, 127, 0.6);
+}
+.lyrics .legend i {
+  display: inline-block;
+  width: 18px;
+  height: 3px;
+  margin-right: 6px;
+  vertical-align: 3px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, var(--accent), rgba(255, 61, 127, 0));
+}
+/* Instrumental break: how long until singing resumes. */
+.break-panel {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin: 4px 0 18px;
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+}
+.break-panel .bar {
+  width: 220px;
+  max-width: 60vw;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.break-panel .bar span {
+  display: block;
+  height: 100%;
+  width: 0;
+  background: var(--accent);
 }
 .countdown {
   display: flex;
@@ -647,6 +863,16 @@ select {
   font-family: var(--font-ui);
   font-size: 14px;
   margin-top: 16px;
+}
+.lyrics .align-note {
+  position: absolute;
+  top: 10px;
+  left: 50%;
+  transform: translateX(-50%);
+  color: var(--muted);
+  font-family: var(--font-ui);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
 }
 .plain-lyrics {
   overflow-y: auto;
@@ -862,6 +1088,11 @@ select {
 }
 .rec-btn.on i {
   animation: pulse 1s infinite;
+}
+/* Mic switch beside Rec: red while the mic is off. */
+.mic-btn.off {
+  color: var(--danger);
+  background: rgba(244, 63, 94, 0.12);
 }
 .meters {
   display: flex;
@@ -1445,8 +1676,55 @@ select {
   color: var(--text);
   font-weight: 600;
 }
-.err {
+.err,
+.status-box b.err {
   color: var(--danger);
+}
+.status-box small {
+  color: var(--muted);
+  font-weight: 400;
+}
+.latency-box {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Export in progress, in a corner whatever view is open. */
+.export-pill {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 60;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px 8px 12px;
+  border-radius: 12px;
+  background: rgba(20, 18, 28, 0.92);
+  border: 1px solid var(--line-2);
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.7);
+  font-size: 12.5px;
+  font-variant-numeric: tabular-nums;
+}
+.export-pill-bar {
+  width: 90px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.export-pill-bar div {
+  height: 100%;
+  background: var(--accent);
+}
+.export-pill button {
+  font-size: 12px;
+  color: var(--muted);
+  padding: 2px 6px;
+  border-radius: 6px;
+}
+.export-pill button:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.08);
 }
 
 /* ----------------------------------------------------------------- toasts */
@@ -1751,6 +2029,78 @@ select {
   height: 12px;
 }
 
+/* Delete a sung song: shows on hover, asks once more before deleting. */
+.card .del-btn {
+  position: absolute;
+  right: 8px;
+  top: 8px;
+  height: 26px;
+  min-width: 26px;
+  padding: 0 8px;
+  border-radius: 8px;
+  border: 0;
+  background: rgba(11, 10, 16, 0.72);
+  color: var(--text, #f5f2fb);
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s;
+}
+.card:hover .del-btn,
+.card .del-btn.confirm,
+.card .del-btn:focus-visible {
+  opacity: 1;
+}
+.card .del-btn:hover,
+.card .del-btn.confirm {
+  background: #e5484d;
+  color: #fff;
+}
+/* How far the song's preparation has got. */
+.card .status {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.card .status {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+.card .status.done {
+  color: #3dd68c;
+}
+.card .status-action {
+  flex: none;
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text, #f5f2fb);
+  border-radius: 7px;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.card .status-action:hover {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+/* "Fit lyrics to the singer" on the stage. */
+.lyrics .align-start {
+  border: 1px solid rgba(255, 255, 255, 0.16);
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 999px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.lyrics .align-start:hover {
+  color: #fff;
+  background: var(--accent);
+  border-color: var(--accent);
+}
 .card .instant {
   position: absolute;
   left: 8px;
@@ -1767,4 +2117,62 @@ select {
   border: 1px solid rgba(255, 255, 255, 0.18);
   -webkit-backdrop-filter: blur(8px);
   backdrop-filter: blur(8px);
+}
+
+/* Double-click a word to correct its spelling. */
+.lyric-line .word {
+  cursor: text;
+}
+.lyric-line .word-edit {
+  font: inherit;
+  letter-spacing: inherit;
+  color: #fff;
+  background: rgba(255, 255, 255, 0.08);
+  border: 1px solid var(--accent);
+  border-radius: 0.15em;
+  padding: 0 0.1em;
+  outline: none;
+  text-align: center;
+  min-width: 2ch;
+}
+
+/* Words speech recognition wasn't sure of: dotted underline, worth a look. */
+.lyric-line .word.unsure .w {
+  text-decoration: underline dotted;
+  text-decoration-color: rgba(255, 200, 120, 0.75);
+  text-decoration-thickness: 0.06em;
+  text-underline-offset: 0.18em;
+}
+/* Singing with no words heard: a stand-in to type the lyrics into. */
+.lyric-line .word.hum .w {
+  letter-spacing: 0.25em;
+  font-style: italic;
+}
+
+/* Delete a whole line (shown on hover, beside it). */
+.lyric-track .tl {
+  position: relative;
+}
+.lyric-line .line-del {
+  position: absolute;
+  right: -1.6em;
+  top: 50%;
+  transform: translateY(-50%);
+  font-size: 0.4em;
+  width: 1.8em;
+  height: 1.8em;
+  border-radius: 50%;
+  border: 1px solid rgba(255, 255, 255, 0.2);
+  background: rgba(11, 10, 16, 0.6);
+  color: rgba(245, 242, 251, 0.7);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.2s;
+}
+.lyric-line:hover .line-del {
+  opacity: 1;
+}
+.lyric-line .line-del:hover {
+  color: #fff;
+  border-color: var(--accent);
 }

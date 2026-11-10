@@ -1,18 +1,19 @@
+import { useEffect, useRef } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
-import { api } from "../lib/api";
 import { closeSong, openSong, startThreshold } from "../lib/loader";
 import { keyName } from "../lib/music";
-import { useStore, type Phase } from "../lib/store";
+import { songTime, useStore, type Phase } from "../lib/store";
 import { Check, Circle, Play } from "./Icons";
 import { Lyrics } from "./Lyrics";
 import { MixPanel, SidebarTabs, SongPanel, TunePanel, VoicePanel } from "./Panels";
 import { PitchGraph } from "./PitchGraph";
-import { togglePlay, Transport } from "./Transport";
+import { playFromStart, togglePlay, Transport } from "./Transport";
 
 const STEPS: { phase: Phase; label: string }[] = [
-  { phase: "searching", label: "Finding the original recording" },
-  { phase: "downloading", label: "Downloading audio" },
-  { phase: "separating", label: "Separating the vocals with AI" },
+  { phase: "searching", label: "Tìm bản thu gốc" },
+  { phase: "downloading", label: "Tải âm thanh" },
+  { phase: "separating", label: "Tách giọng hát bằng AI" },
 ];
 
 function LoadingCard() {
@@ -31,10 +32,10 @@ function LoadingCard() {
             </p>
             <div className="row">
               <button className="btn" onClick={closeSong}>
-                Back to search
+                Về trang tìm kiếm
               </button>
               <button className="btn primary" onClick={() => openSong(song.meta)}>
-                Try again
+                Thử lại
               </button>
             </div>
           </>
@@ -43,9 +44,10 @@ function LoadingCard() {
             {STEPS.map((s, i) => (
               <div key={s.phase} className={i < order ? "done" : i === order ? "on" : ""}>
                 {i < order ? <Check style={{ color: "var(--ok)" }} /> : i === order ? <div className="spinner" /> : <Circle />}
-                {s.label}
+                {s.phase === "separating" && i === order && !song.separation ? "Mở bài đã tách sẵn" : s.label}
                 {i === order && s.phase === "downloading" && song.progress > 0 && ` · ${Math.round(song.progress * 100)}%`}
-                {i === order && s.phase === "separating" && song.separation && song.separation.ready > 0 && ` · ${Math.round(song.separation.ready)} s ready`}
+                {i === order && s.phase === "separating" && song.separation && ` · ${Math.round(song.separation.fraction * 100)}%`}
+                {i === order && s.phase === "separating" && song.separation && song.separation.ready > 0 && ` · ${Math.round(song.separation.ready)} giây đã sẵn sàng`}
               </div>
             ))}
             {song.phase === "separating" && song.separation && <SeparationBar />}
@@ -69,8 +71,8 @@ function SeparationBar() {
         <div style={{ width: `${frac * 100}%` }} />
       </div>
       <p className="help" style={{ marginTop: 8 }}>
-        {p.speed > 0 ? `Running ${p.speed.toFixed(1)}× faster than real time. ` : "Loading the AI model… "}
-        You can start once {Math.round(target)} s are ready; the rest finishes while you sing. Next time this song starts instantly.
+        {p.speed > 0 ? `Đang chạy nhanh gấp ${p.speed.toFixed(1)} lần thời gian thực. ` : "Đang tải mô hình AI… "}
+        Có thể bắt đầu hát khi đã sẵn sàng {Math.round(target)} giây; phần còn lại xử lý tiếp trong lúc bạn hát. Lần sau bài này mở là hát ngay.
       </p>
     </div>
   );
@@ -81,16 +83,16 @@ function StartCard() {
   return (
     <div className="overlay" style={{ background: "rgba(11,10,16,0.35)" }}>
       <div className="start-card">
-        <div className="ready">Ready</div>
+        <div className="ready">Sẵn sàng</div>
         <h2>{song.meta.title}</h2>
         <div className="a">{song.meta.artist}</div>
-        <button className="btn primary big" onClick={() => api.play()} autoFocus>
-          <Play /> Start singing
+        <button className="btn primary big" onClick={() => void playFromStart()} autoFocus>
+          <Play /> Bắt đầu hát
         </button>
         <div className="hint">
-          <span className="kbd">Space</span> play/pause · <span className="kbd">←</span>
-          <span className="kbd">→</span> seek · <span className="kbd">[</span>
-          <span className="kbd">]</span> lyric timing · <span className="kbd">F</span> fullscreen
+          <span className="kbd">Space</span> phát/tạm dừng · <span className="kbd">←</span>
+          <span className="kbd">→</span> tua · <span className="kbd">[</span>
+          <span className="kbd">]</span> canh lời · <span className="kbd">F</span> toàn màn hình · <span className="kbd">M</span> bật/tắt mic
         </div>
       </div>
     </div>
@@ -114,40 +116,39 @@ function ScoreCard() {
     <div className="overlay">
       <div className="scorecard">
         <div className="ready" style={{ color: "var(--muted)", letterSpacing: "0.18em", fontSize: 12, fontWeight: 700 }}>
-          PERFORMANCE
+          KẾT QUẢ
         </div>
         <div className="grade">{sang ? grade(score.accuracy) : "–"}</div>
         <div className="stats">
           <div>
             <b>{sang ? `${Math.round(score.accuracy)}%` : "–"}</b>
-            <span>pitch accuracy</span>
+            <span>độ chuẩn cao độ</span>
           </div>
           <div>
             <b>{score.points.toLocaleString()}</b>
-            <span>points</span>
+            <span>điểm</span>
           </div>
           <div>
             <b>{Math.round(score.sung)}s</b>
-            <span>sung</span>
+            <span>đã hát</span>
           </div>
         </div>
         <div className="row">
           <button className="btn" onClick={closeSong}>
-            New song
+            Bài khác
           </button>
           {lastRecording && (
             <button className="btn" onClick={() => revealItemInDir(lastRecording)}>
-              Show recording
+              Xem bản thu
             </button>
           )}
           <button
             className="btn primary"
             onClick={() => {
-              useStore.setState({ ended: false });
-              void api.seek(0).then(() => api.play());
+              void playFromStart();
             }}
           >
-            Sing {song.meta.title.length > 18 ? "it" : `"${song.meta.title}"`} again
+            Hát lại{song.meta.title.length > 18 ? "" : ` "${song.meta.title}"`}
           </button>
         </div>
       </div>
@@ -155,8 +156,37 @@ function ScoreCard() {
   );
 }
 
+/** The recording's video behind the lyrics, kept in step with the music. */
+function StageVideo({ path }: { path: string }) {
+  const ref = useRef<HTMLVideoElement>(null);
+  useEffect(() => {
+    let raf = 0;
+    const loop = () => {
+      raf = requestAnimationFrame(loop);
+      const v = ref.current;
+      if (!v || v.readyState < 1) return;
+      const { playing, song } = useStore.getState();
+      // The video runs on the original recording's clock, like the lyrics.
+      const tempo = song?.info?.tempo || 1;
+      const want = songTime() * tempo;
+      if (Math.abs(v.playbackRate - tempo) > 1e-3) v.playbackRate = tempo;
+      if (playing) {
+        if (v.paused) void v.play().catch(() => {});
+        if (Math.abs(v.currentTime - want) > 0.2) v.currentTime = want;
+      } else {
+        if (!v.paused) v.pause();
+        if (Math.abs(v.currentTime - want) > 0.05) v.currentTime = want;
+      }
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, []);
+  return <video ref={ref} className="stage-video" src={convertFileSrc(path)} muted playsInline preload="auto" />;
+}
+
 export function Stage() {
   const song = useStore((s) => s.song);
+  const videoPath = useStore((s) => (s.videoBg && s.song?.video?.status === "ready" ? s.song.video.path : undefined));
   const tab = useStore((s) => s.tab);
   const sidebar = useStore((s) => s.sidebar);
   const playing = useStore((s) => s.playing);
@@ -174,7 +204,9 @@ export function Stage() {
 
   return (
     <div className={`stage ${sidebar ? "" : "no-sidebar"}`}>
-      <div className="stage-bg">{song.meta.artwork && <img src={song.meta.artwork} alt="" />}</div>
+      <div className={`stage-bg ${videoPath ? "video-on" : ""}`}>
+        {videoPath ? <StageVideo path={videoPath} /> : song.meta.artwork && <img src={song.meta.artwork} alt="" />}
+      </div>
       <div className="stage-main">
         <div className="song-head">
           {song.meta.artwork ? <img src={song.meta.artwork} alt="" /> : <div className="art-ph" />}
@@ -186,35 +218,35 @@ export function Stage() {
             {recording && (
               <span className="chip">
                 <span className="dot live" />
-                <b>Recording</b>
+                <b>Đang thu</b>
               </span>
             )}
-            <span className="chip" title="Autotune target key">
+            <span className="chip" title="Tông autotune đang dùng">
               <span className={`dot ${tuneOn ? "ok" : ""}`} />
-              Autotune <b>{tuneOn ? keyName(tuneKey, tuneScale) : "off"}</b>
+              Autotune <b>{tuneOn ? keyName(tuneKey, tuneScale) : "tắt"}</b>
             </span>
             {song.info && (song.info.semitones !== 0 || song.info.tempo !== 1) && (
               <span className="chip">
                 {song.info.semitones !== 0 && (
                   <b>
                     {song.info.semitones > 0 ? "+" : ""}
-                    {song.info.semitones} st
+                    {song.info.semitones} nửa cung
                   </b>
                 )}
                 {song.info.tempo !== 1 && <b>{Math.round(song.info.tempo * 100)}%</b>}
               </span>
             )}
-            {song.info?.vocalRemoved && <span className="chip">Basic vocal remover</span>}
+            {song.info?.vocalRemoved && <span className="chip">Lọc giọng cơ bản</span>}
             {song.info?.separating && song.separation && (
-              <span className="chip" title="The AI keeps separating the rest of the song while you sing">
+              <span className="chip" title="AI vẫn tiếp tục tách phần còn lại của bài trong lúc bạn hát">
                 <span className="spinner" style={{ width: 11, height: 11, borderWidth: 1.5 }} />
-                Separating <b>{Math.round(song.separation.fraction * 100)}%</b>
+                Đang tách <b>{Math.round(song.separation.fraction * 100)}%</b>
               </span>
             )}
             {buffering && (
               <span className="chip">
                 <span className="dot warn" />
-                <b>Catching up…</b>
+                <b>Đang bắt kịp…</b>
               </span>
             )}
           </div>

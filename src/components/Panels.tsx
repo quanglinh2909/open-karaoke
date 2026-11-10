@@ -1,8 +1,10 @@
 import { useEffect, useRef, useState } from "react";
-import { switchSource, switchToVocalRemover, transform } from "../lib/loader";
+import { loadVideo, rememberTransform, switchSource, switchToVocalRemover, transform } from "../lib/loader";
 import { formatTime, HARMONIES, keyName, NOTE_NAMES, SCALES } from "../lib/music";
 import { FX_PRESETS, SOUND_KEYS, TUNE_PRESETS, type Preset } from "../lib/presets";
 import { useStore, type Tab } from "../lib/store";
+import { cancelExport, startExport } from "../lib/exportJob";
+import type { LyricStyle, Orientation } from "../lib/videoExport";
 import { db, Group, ms, ParamSlider, ParamToggle, pct, Segmented, Select, semis, Slider, Toggle } from "./Controls";
 
 function matches(values: Record<string, number>, params: Record<string, number>) {
@@ -42,16 +44,16 @@ function MyPresets() {
     savePreset(n, values);
     setNaming(false);
     setName("");
-    toast(`Saved "${n}"`, "success");
+    toast(`Đã lưu "${n}"`, "success");
   };
 
   return (
     <Group
-      title="My presets"
+      title="Mẫu của tôi"
       extra={
         !naming && (
           <button className="badge muted" style={{ cursor: "pointer" }} onClick={() => setNaming(true)}>
-            + Save current
+            + Lưu hiện tại
           </button>
         )
       }
@@ -61,7 +63,7 @@ function MyPresets() {
           <input
             autoFocus
             className="text-input"
-            placeholder="Name this sound…"
+            placeholder="Đặt tên cho âm thanh này…"
             value={name}
             maxLength={32}
             onChange={(e) => setName(e.target.value)}
@@ -71,7 +73,7 @@ function MyPresets() {
             }}
           />
           <button className="btn small primary" onClick={save} disabled={!name.trim()}>
-            Save
+            Lưu
           </button>
         </div>
       )}
@@ -79,17 +81,17 @@ function MyPresets() {
         <div className="presets">
           {myPresets.map((p) => (
             <span key={p.name} className={`preset my ${matches(p.values, params) ? "on" : ""}`}>
-              <button onClick={() => setParams(p.values)} title="Apply">
+              <button onClick={() => setParams(p.values)} title="Áp dụng">
                 {p.name}
               </button>
-              <button className="x" title="Delete" onClick={() => deletePreset(p.name)}>
+              <button className="x" title="Xóa" onClick={() => deletePreset(p.name)}>
                 ×
               </button>
             </span>
           ))}
         </div>
       ) : (
-        !naming && <p className="help" style={{ marginTop: 0 }}>Shape your autotune and effects, then save the combination here.</p>
+        !naming && <p className="help" style={{ marginTop: 0 }}>Chỉnh autotune và hiệu ứng rồi lưu bộ cài đặt ở đây.</p>
       )}
     </Group>
   );
@@ -112,17 +114,17 @@ export function TunePanel() {
   return (
     <div className="panel">
       <Group title="Autotune">
-        <ParamToggle name="tune_enabled" label="Pitch correction" hint="Snaps your voice to the song's key" />
+        <ParamToggle name="tune_enabled" label="Chỉnh cao độ" hint="Kéo giọng bạn về đúng tông bài hát" />
         <PresetRow presets={TUNE_PRESETS} />
       </Group>
       <MyPresets />
 
       <Group
-        title="Key"
+        title="Tông"
         extra={
           detected && (
-            <span className={`badge ${keyAuto ? "" : "muted"}`} title={`Detected with ${Math.round(detected.confidence * 100)}% confidence`}>
-              {keyAuto ? "Auto" : "Manual"}
+            <span className={`badge ${keyAuto ? "" : "muted"}`} title={`Nhận diện với độ tin cậy ${Math.round(detected.confidence * 100)}%`}>
+              {keyAuto ? "Tự động" : "Thủ công"}
             </span>
           )
         }
@@ -133,7 +135,7 @@ export function TunePanel() {
         </div>
         {detected && !keyAuto && (
           <p className="help">
-            Song detected in {keyName(detected.tonic + Math.round(song?.info?.semitones ?? 0), detected.minor ? 2 : 1)}.{" "}
+            Tông nhận diện của bài: {keyName(detected.tonic + Math.round(song?.info?.semitones ?? 0), detected.minor ? 2 : 1)}.{" "}
             <button
               style={{ color: "var(--accent)", fontWeight: 600 }}
               onClick={() => {
@@ -141,40 +143,40 @@ export function TunePanel() {
                 setParams({ tune_key: ((detected.tonic + Math.round(song?.info?.semitones ?? 0)) % 12 + 12) % 12, tune_scale: detected.minor ? 2 : 1 });
               }}
             >
-              Use it
+              Dùng tông này
             </button>
           </p>
         )}
       </Group>
 
-      <Group title="Correction">
-        <ParamSlider name="tune_retune_ms" label="Retune speed" min={0} max={400} step={1} format={(v) => (v < 1 ? "Instant" : ms(v))} left="Robotic" right="Natural" reset={40} />
-        <ParamSlider name="tune_amount" label="Amount" min={0} max={1} format={pct} reset={1} />
-        <ParamSlider name="tune_humanize" label="Humanize" min={0} max={1} format={pct} reset={0.3} left="Tight" right="Loose sustains" />
-        <ParamSlider name="tune_flex" label="Flex-tune" min={0} max={50} step={1} format={(v) => (v < 1 ? "Off" : `${Math.round(v)}¢`)} left="Correct all" right="Keep expression" reset={0} />
-        <ParamSlider name="tune_sensitivity" label="Detection threshold" min={0.5} max={0.95} format={pct} reset={0.8} />
+      <Group title="Hiệu chỉnh">
+        <ParamSlider name="tune_retune_ms" label="Tốc độ chỉnh" min={0} max={400} step={1} format={(v) => (v < 1 ? "Tức thì" : ms(v))} left="Máy móc" right="Tự nhiên" reset={40} />
+        <ParamSlider name="tune_amount" label="Mức độ" min={0} max={1} format={pct} reset={1} />
+        <ParamSlider name="tune_humanize" label="Tự nhiên hóa" min={0} max={1} format={pct} reset={0.3} left="Chặt" right="Thả lỏng nốt ngân" />
+        <ParamSlider name="tune_flex" label="Flex-tune" min={0} max={50} step={1} format={(v) => (v < 1 ? "Tắt" : `${Math.round(v)}¢`)} left="Chỉnh hết" right="Giữ biểu cảm" reset={0} />
+        <ParamSlider name="tune_sensitivity" label="Ngưỡng nhận diện" min={0.5} max={0.95} format={pct} reset={0.8} />
       </Group>
 
       <Group title="Vibrato">
-        <ParamSlider name="tune_vibrato_depth" label="Depth" min={0} max={80} step={1} format={(v) => (v < 1 ? "Off" : `${Math.round(v)}¢`)} reset={0} />
-        <ParamSlider name="tune_vibrato_rate" label="Rate" min={3} max={8} step={0.1} format={(v) => `${v.toFixed(1)} Hz`} reset={5.5} />
+        <ParamSlider name="tune_vibrato_depth" label="Độ sâu" min={0} max={80} step={1} format={(v) => (v < 1 ? "Tắt" : `${Math.round(v)}¢`)} reset={0} />
+        <ParamSlider name="tune_vibrato_rate" label="Tốc độ" min={3} max={8} step={0.1} format={(v) => `${v.toFixed(1)} Hz`} reset={5.5} />
       </Group>
 
-      <Group title="Voice character">
-        <ParamSlider name="tune_transpose" label="Pitch shift" min={-12} max={12} step={1} format={semis} reset={0} />
-        <ParamSlider name="tune_formant" label="Formant" min={-8} max={8} step={0.5} format={semis} left="Deeper" right="Brighter" reset={0} />
-        <ParamSlider name="tune_mix" label="Wet / dry" min={0} max={1} format={pct} reset={1} />
+      <Group title="Chất giọng">
+        <ParamSlider name="tune_transpose" label="Dịch cao độ" min={-12} max={12} step={1} format={semis} reset={0} />
+        <ParamSlider name="tune_formant" label="Formant" min={-8} max={8} step={0.5} format={semis} left="Trầm hơn" right="Sáng hơn" reset={0} />
+        <ParamSlider name="tune_mix" label="Tỉ lệ xử lý / gốc" min={0} max={1} format={pct} reset={1} />
       </Group>
 
-      <Group title="Harmonizer">
+      <Group title="Bè">
         <div className="two" style={{ marginBottom: 14 }}>
           <Select value={Math.round(params.harmony_a)} options={HARMONIES} onChange={(v) => setParam("harmony_a", v)} />
           <Select value={Math.round(params.harmony_b)} options={HARMONIES} onChange={(v) => setParam("harmony_b", v)} />
         </div>
-        <ParamSlider name="harmony_level" label="Harmony level" min={0} max={1} format={pct} reset={0.5} />
-        <ParamSlider name="harmony_spread" label="Stereo spread" min={0} max={1} format={pct} reset={0.7} />
-        <ParamSlider name="doubler" label="Doubler" min={0} max={1} format={(v) => (v < 0.01 ? "Off" : pct(v))} reset={0} />
-        <p className="help">Harmonies follow the scale, so a "3rd above" is always a note that belongs to the key.</p>
+        <ParamSlider name="harmony_level" label="Mức bè" min={0} max={1} format={pct} reset={0.5} />
+        <ParamSlider name="harmony_spread" label="Độ rộng stereo" min={0} max={1} format={pct} reset={0.7} />
+        <ParamSlider name="doubler" label="Nhân đôi giọng" min={0} max={1} format={(v) => (v < 0.01 ? "Tắt" : pct(v))} reset={0} />
+        <p className="help">Bè đi theo thang âm, nên "quãng 3 trên" luôn là nốt thuộc tông.</p>
       </Group>
     </div>
   );
@@ -183,31 +185,31 @@ export function TunePanel() {
 export function VoicePanel() {
   return (
     <div className="panel">
-      <Group title="Vocal effects">
+      <Group title="Hiệu ứng giọng">
         <PresetRow presets={FX_PRESETS} />
       </Group>
       <MyPresets />
-      <Group title="Input">
-        <ParamSlider name="vocal_gain_db" label="Mic gain" min={-12} max={24} step={0.5} format={db} reset={0} />
-        <ParamSlider name="gate_db" label="Noise gate" min={-80} max={-20} step={1} format={(v) => (v <= -79 ? "Off" : `${Math.round(v)} dB`)} reset={-50} />
-        <ParamSlider name="hpf_hz" label="Low cut" min={20} max={400} step={1} format={(v) => `${Math.round(v)} Hz`} reset={90} />
+      <Group title="Đầu vào">
+        <ParamSlider name="vocal_gain_db" label="Độ lợi mic" min={-12} max={24} step={0.5} format={db} reset={0} />
+        <ParamSlider name="gate_db" label="Cổng lọc ồn" min={-80} max={-20} step={1} format={(v) => (v <= -79 ? "Tắt" : `${Math.round(v)} dB`)} reset={-50} />
+        <ParamSlider name="hpf_hz" label="Cắt trầm" min={20} max={400} step={1} format={(v) => `${Math.round(v)} Hz`} reset={90} />
       </Group>
-      <Group title="Tone">
-        <ParamSlider name="eq_low_db" label="Warmth" min={-12} max={12} step={0.5} format={db} reset={0} />
-        <ParamSlider name="eq_presence_db" label="Presence" min={-12} max={12} step={0.5} format={db} reset={2} />
-        <ParamSlider name="eq_air_db" label="Air" min={-12} max={12} step={0.5} format={db} reset={2} />
-        <ParamSlider name="deesser" label="De-esser" min={0} max={1} format={pct} reset={0.4} />
-        <ParamSlider name="comp" label="Compression" min={0} max={1} format={pct} reset={0.5} />
+      <Group title="Âm sắc">
+        <ParamSlider name="eq_low_db" label="Độ ấm" min={-12} max={12} step={0.5} format={db} reset={0} />
+        <ParamSlider name="eq_presence_db" label="Độ rõ" min={-12} max={12} step={0.5} format={db} reset={2} />
+        <ParamSlider name="eq_air_db" label="Độ thoáng" min={-12} max={12} step={0.5} format={db} reset={2} />
+        <ParamSlider name="deesser" label="Giảm âm xì" min={0} max={1} format={pct} reset={0.4} />
+        <ParamSlider name="comp" label="Nén" min={0} max={1} format={pct} reset={0.5} />
       </Group>
-      <Group title="Echo">
-        <ParamSlider name="delay_mix" label="Level" min={0} max={0.8} format={pct} reset={0} />
-        <ParamSlider name="delay_ms" label="Time" min={60} max={1200} step={5} format={ms} reset={320} />
-        <ParamSlider name="delay_feedback" label="Repeats" min={0} max={0.9} format={pct} reset={0.3} />
+      <Group title="Tiếng vọng">
+        <ParamSlider name="delay_mix" label="Mức" min={0} max={0.8} format={pct} reset={0} />
+        <ParamSlider name="delay_ms" label="Thời gian" min={60} max={1200} step={5} format={ms} reset={320} />
+        <ParamSlider name="delay_feedback" label="Số lần lặp" min={0} max={0.9} format={pct} reset={0.3} />
       </Group>
-      <Group title="Reverb">
-        <ParamSlider name="reverb_mix" label="Level" min={0} max={0.8} format={pct} reset={0.18} />
-        <ParamSlider name="reverb_size" label="Room size" min={0} max={1} format={pct} reset={0.7} />
-        <ParamSlider name="reverb_damp" label="Damping" min={0} max={1} format={pct} reset={0.4} />
+      <Group title="Vang">
+        <ParamSlider name="reverb_mix" label="Mức" min={0} max={0.8} format={pct} reset={0.18} />
+        <ParamSlider name="reverb_size" label="Kích thước phòng" min={0} max={1} format={pct} reset={0.7} />
+        <ParamSlider name="reverb_damp" label="Độ tắt dần" min={0} max={1} format={pct} reset={0.4} />
       </Group>
     </div>
   );
@@ -220,25 +222,25 @@ export function MixPanel() {
   const setParam = useStore((s) => s.setParam);
   return (
     <div className="panel">
-      <Group title="Levels">
-        <ParamSlider name="instrumental" label="Instrumental" min={0} max={1.2} format={pct} reset={0.85} />
-        <ParamSlider name="vocal" label="Your voice" min={0} max={1.5} format={pct} reset={0.9} />
+      <Group title="Âm lượng">
+        <ParamSlider name="instrumental" label="Nhạc nền" min={0} max={1.2} format={pct} reset={0.85} />
+        <ParamSlider name="vocal" label="Giọng bạn" min={0} max={1.5} format={pct} reset={0.9} />
         {hasGuide && !vocalRemoved && (
-          <ParamSlider name="guide" label="Original singer (guide)" min={0} max={1} format={(v) => (v < 0.01 ? "Off" : pct(v))} reset={0} />
+          <ParamSlider name="guide" label="Giọng ca sĩ gốc (hát mẫu)" min={0} max={1} format={(v) => (v < 0.01 ? "Tắt" : pct(v))} reset={0} />
         )}
-        <ParamSlider name="master" label="Master" min={0} max={1.2} format={pct} reset={0.9} />
+        <ParamSlider name="master" label="Tổng" min={0} max={1.2} format={pct} reset={0.9} />
       </Group>
-      <Group title="Monitoring">
-        <ParamToggle name="monitor" label="Hear myself" hint="Use headphones to avoid feedback through speakers" />
+      <Group title="Nghe lại">
+        <ParamToggle name="monitor" label="Nghe giọng mình" hint="Dùng tai nghe để tránh bị hú qua loa" />
       </Group>
-      <Group title="Recording">
+      <Group title="Thu âm">
         <Toggle
           on={latency < 0}
           onChange={(auto) => setParam("record_latency_ms", auto ? -1 : 40)}
-          label="Automatic latency compensation"
-          hint="Lines your recorded voice up with the music"
+          label="Tự bù độ trễ"
+          hint="Căn giọng thu cho khớp với nhạc"
         />
-        {latency >= 0 && <ParamSlider name="record_latency_ms" label="Manual offset" min={0} max={300} step={1} format={ms} />}
+        {latency >= 0 && <ParamSlider name="record_latency_ms" label="Độ lệch thủ công" min={0} max={300} step={1} format={ms} />}
       </Group>
     </div>
   );
@@ -263,6 +265,8 @@ export function SongPanel() {
   const commit = (s: number, t: number) => {
     setSemi(s);
     setTempo(t);
+    // Saved for this song right away; rendering waits for a pause in clicks.
+    rememberTransform(s, t);
     clearTimeout(timer.current);
     timer.current = window.setTimeout(() => transform(s, t), 450);
   };
@@ -273,8 +277,8 @@ export function SongPanel() {
   return (
     <div className="panel">
       <Group
-        title="Key of the music"
-        extra={song.busy ? <span className="badge muted">{song.busy}</span> : separating && <span className="badge muted">After separation</span>}
+        title="Tông nhạc"
+        extra={song.busy ? <span className="badge muted">{song.busy}</span> : separating && <span className="badge muted">Sau khi tách</span>}
       >
         <div className="stepper" style={separating ? { opacity: 0.45, pointerEvents: "none" } : undefined}>
           <button onClick={() => commit(Math.max(-6, semi - 1), tempo)}>−</button>
@@ -282,39 +286,43 @@ export function SongPanel() {
           <button onClick={() => commit(Math.min(6, semi + 1), tempo)}>+</button>
         </div>
         <p className="help">
-          {info?.key ? `Original key: ${keyName(info.key.tonic, info.key.minor ? 2 : 1)}. ` : ""}Move the song into your vocal range. The
-          autotune key follows automatically.
-          {separating && " Available as soon as the AI finishes separating this song."}
+          {info?.key ? `Tông gốc: ${keyName(info.key.tonic, info.key.minor ? 2 : 1)}. ` : ""}Dời tông bài về tầm giọng của bạn. Tông
+          autotune tự đổi theo.
+          {separating && " Dùng được ngay khi AI tách xong bài này."}
         </p>
       </Group>
 
-      <Group title="Tempo">
+      <Group title="Nhịp độ">
         <div style={separating ? { opacity: 0.45, pointerEvents: "none" } : undefined}>
-          <Slider label="Speed" value={tempo} min={0.7} max={1.3} step={0.05} format={pct} reset={1} onChange={(v) => commit(semi, v)} left="Slower" right="Faster" />
+          <Slider label="Tốc độ" value={tempo} min={0.7} max={1.3} step={0.05} format={pct} reset={1} onChange={(v) => commit(semi, v)} left="Chậm hơn" right="Nhanh hơn" />
         </div>
       </Group>
 
-      <Group title="Lyrics timing" extra={!info?.vocalRemoved && info && <span className="badge">Synced to original</span>}>
+      <VideoGroup />
+
+      <TrimGroup />
+
+      <Group title="Canh lời" extra={!info?.vocalRemoved && info && <span className="badge">Khớp bản gốc</span>}>
         <div className="stepper">
-          <button onClick={() => nudge(-0.1)} title="Lyrics earlier ( [ )">−</button>
+          <button onClick={() => nudge(-0.1)} title="Lời sớm hơn ( [ )">−</button>
           <div className="val">{`${song.userOffset >= 0 ? "+" : ""}${song.userOffset.toFixed(2)} s`}</div>
-          <button onClick={() => nudge(0.1)} title="Lyrics later ( ] )">+</button>
+          <button onClick={() => nudge(0.1)} title="Lời muộn hơn ( ] )">+</button>
         </div>
         <p className="help">
-          The music is separated from the same recording the lyrics are timed to, so they line up on their own. Use{" "}
-          <span className="kbd">[</span> and <span className="kbd">]</span> to fine-tune.
+          Nhạc được tách từ chính bản thu mà lời được canh theo, nên thường tự khớp. Dùng{" "}
+          <span className="kbd">[</span> và <span className="kbd">]</span> để chỉnh tinh.
           {song.userOffset !== 0 && (
             <>
               {" "}
               <button style={{ color: "var(--accent)", fontWeight: 600 }} onClick={() => nudge(-song.userOffset)}>
-                Reset
+                Đặt lại
               </button>
             </>
           )}
         </p>
       </Group>
 
-      <Group title="Recording">
+      <Group title="Bản thu">
         {song.originals
           .filter((r, i) => i === 0 || r.score >= 0)
           .slice(0, 6)
@@ -340,15 +348,177 @@ export function SongPanel() {
               ✂︎
             </div>
             <div>
-              <div className="st">Basic vocal remover</div>
-              <div className="sc">Instant, lower quality. Use if the AI can't run.</div>
+              <div className="st">Lọc giọng cơ bản</div>
+              <div className="sc">Tức thì, chất lượng thấp hơn. Dùng khi AI không chạy được.</div>
             </div>
           </button>
         )}
-        {!song.originals.length && <p className="help">Searching for the original recording…</p>}
-        <p className="help">The AI separates the vocals from whichever recording you pick. Choose another if this one has a long intro or is a live version.</p>
+        {!song.originals.length && <p className="help">Đang tìm bản thu gốc…</p>}
+        <p className="help">AI tách giọng từ bản thu bạn chọn. Chọn bản khác nếu bản này có đoạn dạo dài hoặc là bản live.</p>
       </Group>
+
+      <ExportVideo />
     </div>
+  );
+}
+
+/** Render the song as a karaoke video (instrumental + lyrics) to MP4. */
+function ExportVideo() {
+  const song = useStore((s) => s.song);
+  const job = useStore((s) => s.exportJob);
+  const [orientation, setOrientation] = useState<Orientation>("landscape");
+  // The lyric style is remembered between exports.
+  const [style, setStyleState] = useState<LyricStyle>(() => {
+    try {
+      return (localStorage.getItem("openkaraoke.lyricStyle.v1") as LyricStyle) || "scroll";
+    } catch {
+      return "scroll";
+    }
+  });
+  const setStyle = (v: LyricStyle) => {
+    setStyleState(v);
+    try {
+      localStorage.setItem("openkaraoke.lyricStyle.v1", v);
+    } catch {
+      /* storage unavailable */
+    }
+  };
+  const ready = !!song?.info && !song.info.separating && song.phase === "ready";
+  const progress = job?.progress ?? null;
+
+  return (
+    <Group title="Xuất video karaoke">
+      <Segmented
+        value={orientation}
+        onChange={setOrientation}
+        options={[
+          { label: "Ngang 16:9", value: "landscape" },
+          { label: "Dọc 9:16", value: "portrait" },
+        ]}
+      />
+      <div style={{ marginTop: 10 }}>
+        <Segmented
+          value={style}
+          onChange={setStyle}
+          options={[
+            { label: "Cuộn giữa", value: "scroll" },
+            { label: "Karaoke cổ điển", value: "classic" },
+            { label: "Phụ đề", value: "subtitle" },
+          ]}
+        />
+      </div>
+      <p className="help" style={{ marginTop: 6 }}>
+        {style === "scroll"
+          ? "Lời cuộn ở giữa, câu đang hát to rõ (như màn hình hát)."
+          : style === "classic"
+            ? "Hai dòng ở dưới, trên trái dưới phải, luân phiên như đầu karaoke."
+            : "Câu đang hát ở đáy màn hình, chừa trọn khung hình cho video."}
+      </p>
+      {progress === null ? (
+        <button className="btn primary" style={{ width: "100%", marginTop: 12 }} disabled={!ready} onClick={() => void startExport(orientation, style)}>
+          Xuất video
+        </button>
+      ) : (
+        <div style={{ marginTop: 12 }}>
+          <div className="progress">
+            <div style={{ width: `${progress * 100}%` }} />
+          </div>
+          <div className="row" style={{ justifyContent: "space-between", marginTop: 8, alignItems: "center" }}>
+            <span className="help" style={{ margin: 0 }}>
+              Đang dựng video{job && job.title !== song?.meta.title ? ` "${job.title}"` : ""}… {Math.round(progress * 100)}%
+            </span>
+            <button className="btn small" onClick={cancelExport}>
+              Hủy
+            </button>
+          </div>
+        </div>
+      )}
+      <p className="help">
+        Nhạc nền đã tách giọng (đúng tông và nhịp độ đang chỉnh) cùng lời chạy chữ, lưu thành MP4 trong thư mục bản thu.
+        {!ready && " Dùng được khi bài đã tách giọng xong."}
+      </p>
+    </Group>
+  );
+}
+
+/** The recording's own video behind the lyrics, on stage and in exports. */
+function VideoGroup() {
+  const videoBg = useStore((s) => s.videoBg);
+  const setVideoBg = useStore((s) => s.setVideoBg);
+  const video = useStore((s) => s.song?.video);
+  return (
+    <Group title="Video gốc">
+      <Toggle
+        on={videoBg}
+        onChange={(on) => {
+          setVideoBg(on);
+          if (on) void loadVideo();
+        }}
+        label="Dùng video gốc làm nền (HD)"
+        hint="Tải video của bài (tối đa 1080p) để chạy sau lời khi hát và khi xuất video karaoke."
+      />
+      {videoBg && video && (
+        <p className={`help ${video.status === "error" ? "err" : ""}`} style={{ marginTop: 6 }}>
+          {video.status === "loading"
+            ? `Đang tải video HD… ${Math.round(video.progress * 100)}%`
+            : video.status === "ready"
+              ? "Video HD đã sẵn sàng."
+              : `Không tải được video: ${video.message ?? ""}`}
+        </p>
+      )}
+    </Group>
+  );
+}
+
+/** Skip an ad or talk at the start and end of this song's recording. */
+function TrimGroup() {
+  const song = useStore((s) => s.song);
+  const pos = useStore((s) => s.pos);
+  const duration = useStore((s) => s.duration);
+  const patchSong = useStore((s) => s.patchSong);
+  if (!song?.info) return null;
+  const tempo = song.info.tempo || 1;
+  const trim = song.trim ?? { start: 0, end: 0 };
+  // Recording seconds (the trim is kept in the original recording's time).
+  const length = duration * tempo;
+  const set = (t: Partial<typeof trim>) => {
+    const next = { ...trim, ...t };
+    next.start = Math.max(0, Math.min(length - 5, Math.round(next.start)));
+    next.end = Math.max(0, Math.min(length - next.start - 5, Math.round(next.end)));
+    patchSong({ trim: next });
+  };
+  const row = (label: string, value: number, change: (v: number) => void, here: () => void) => (
+    <div className="trim-row">
+      <span className="trim-label">{label}</span>
+      <div className="stepper small">
+        <button onClick={() => change(value - 1)}>−</button>
+        <div className="val">{value ? formatTime(value) : "Không"}</div>
+        <button onClick={() => change(value + 1)}>+</button>
+      </div>
+      <button className="btn small" onClick={here} title="Lấy đúng chỗ đang phát">
+        Đặt tại đây
+      </button>
+    </div>
+  );
+  return (
+    <Group title="Bỏ qua quảng cáo">
+      {row(
+        "Bỏ đầu bài",
+        trim.start,
+        (v) => set({ start: v }),
+        () => set({ start: pos * tempo }),
+      )}
+      {row(
+        "Bỏ cuối bài",
+        trim.end,
+        (v) => set({ end: v }),
+        () => set({ end: (duration - pos) * tempo }),
+      )}
+      <p className="help">
+        Nghe tới chỗ hết quảng cáo đầu bài (hoặc chỗ bắt đầu quảng cáo cuối bài) rồi bấm <b>Đặt tại đây</b>. Bài sẽ bắt đầu và kết thúc ở đó, kể cả trong video
+        xuất ra. Lưu riêng cho bài này.
+      </p>
+    </Group>
   );
 }
 
@@ -356,10 +526,10 @@ export function SidebarTabs({ lab = false }: { lab?: boolean }) {
   const tab = useStore((s) => s.tab);
   const set = useStore((s) => s.set);
   const options: { label: string; value: Tab }[] = [
-    { label: "Tune", value: "tune" },
-    { label: "Voice", value: "voice" },
-    { label: "Mix", value: "mix" },
+    { label: "Chỉnh", value: "tune" },
+    { label: "Giọng", value: "voice" },
+    { label: "Trộn", value: "mix" },
   ];
-  if (!lab) options.push({ label: "Song", value: "song" });
+  if (!lab) options.push({ label: "Bài hát", value: "song" });
   return <Segmented value={tab} onChange={(t) => set({ tab: t })} options={options} />;
 }

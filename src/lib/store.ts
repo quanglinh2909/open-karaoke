@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type AudioStatus, type PitchPoint, type Score, type SeparateProgress, type SongInfo, type SongMeta, type Tick, type ToolStatus } from "./api";
+import { api, type AudioStatus, type MelodyNote, type PitchPoint, type Score, type SeparateProgress, type SongInfo, type SongMeta, type Tick, type ToolStatus } from "./api";
 import type { Line } from "./lrc";
 import { DEFAULT_PARAMS, type Params } from "./presets";
 import type { Ranked } from "./sources";
@@ -30,6 +30,17 @@ export interface SongState {
   separation: SeparateProgress | null;
   /** Manual lyric nudge, seconds (positive = lyrics later). */
   userOffset: number;
+  /** While the lyrics are being fitted to the singer: waiting for other songs, listening (Whisper), then timing (MMS). */
+  aligning: { stage: "queue" | "listen" | "time"; fraction: number } | null;
+  /** This song's saved key, tempo and timing are back in place, so changes may be saved. */
+  restored?: boolean;
+  /** Seconds skipped at the start and end of the recording (ads, talk), in
+   * the original recording's time. */
+  trim?: { start: number; end: number };
+  /** The original singer's melody, for the note bars (null until found). */
+  melody?: MelodyNote[] | null;
+  /** The recording's HD video for the background (when wanted). */
+  video?: { status: "loading" | "ready" | "error"; path?: string; progress: number; message?: string } | null;
   /** Autotune key follows the detected song key. */
   keyAuto: boolean;
   busy: string | null;
@@ -46,12 +57,17 @@ export interface AudioPrefs {
   input: string | null;
   output: string | null;
   buffer: number | null;
+  /** WASAPI exclusive mode on Windows (low latency). */
+  exclusive?: boolean;
+  /** ASIO driver to use for both mic and output (Windows), or none. */
+  asio?: string | null;
 }
 
 const PERSIST_KEY = "openkaraoke.params.v1";
 const PREFS_KEY = "openkaraoke.audio.v1";
 const HISTORY_KEY = "openkaraoke.history.v1";
 // Per-song values that should not survive a restart.
+const VIDEO_BG_KEY = "openkaraoke.videoBg.v1";
 const TRANSIENT = new Set(["tune_key", "tune_scale", "drone"]);
 const MY_PRESETS_KEY = "openkaraoke.mypresets.v1";
 
@@ -83,6 +99,11 @@ interface Store {
   tools: ToolStatus | null;
   audio: AudioStatus | null;
   audioPrefs: AudioPrefs;
+  /** Show the recording's video behind the lyrics (and in exported videos). */
+  videoBg: boolean;
+  /** The karaoke video being exported, if any (it runs whatever view is open). */
+  exportJob: { title: string; progress: number } | null;
+  setVideoBg: (on: boolean) => void;
   params: Params;
   song: SongState | null;
   history: SongMeta[];
@@ -114,6 +135,7 @@ interface Store {
   toast: (text: string, kind?: Toast["kind"], action?: Toast["action"]) => void;
   dismiss: (id: number) => void;
   pushHistory: (m: SongMeta) => void;
+  removeHistory: (id: string) => void;
   set: (p: Partial<Store>) => void;
 }
 
@@ -144,12 +166,52 @@ function persist(params: Params) {
 
 let toastId = 0;
 
+function saveHistory(history: SongMeta[]) {
+  useStore.setState({ history });
+  try {
+    localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
+  } catch {
+    /* storage unavailable */
+  }
+}
+
+/** Saved settings, with the old -50 dB noise gate default turned off once:
+ * it closed on soft words from quiet headset mics. */
+function loadParams(): Params {
+  const params = load<Params>(PERSIST_KEY, DEFAULT_PARAMS);
+  try {
+    if (!localStorage.getItem("openkaraoke.gateOff.v1")) {
+      localStorage.setItem("openkaraoke.gateOff.v1", "1");
+      if (params.gate_db === -50) return { ...params, gate_db: DEFAULT_PARAMS.gate_db };
+    }
+  } catch {
+    /* storage unavailable */
+  }
+  return params;
+}
+
 export const useStore = create<Store>((set, get) => ({
   view: "boot",
   tools: null,
   audio: null,
   audioPrefs: load<AudioPrefs>(PREFS_KEY, { input: null, output: null, buffer: 256 }),
-  params: load<Params>(PERSIST_KEY, DEFAULT_PARAMS),
+  exportJob: null,
+  videoBg: (() => {
+    try {
+      return localStorage.getItem(VIDEO_BG_KEY) === "1";
+    } catch {
+      return false;
+    }
+  })(),
+  setVideoBg: (on) => {
+    set({ videoBg: on });
+    try {
+      localStorage.setItem(VIDEO_BG_KEY, on ? "1" : "0");
+    } catch {
+      /* storage unavailable */
+    }
+  },
+  params: loadParams(),
   song: null,
   history: loadList<SongMeta>(HISTORY_KEY),
   pos: 0,
@@ -206,15 +268,8 @@ export const useStore = create<Store>((set, get) => ({
     setTimeout(() => get().dismiss(id), kind === "error" ? 8000 : action ? 9000 : 4500);
   },
   dismiss: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
-  pushHistory: (m) => {
-    const history = [m, ...get().history.filter((h) => h.id !== m.id)].slice(0, 12);
-    set({ history });
-    try {
-      localStorage.setItem(HISTORY_KEY, JSON.stringify(history));
-    } catch {
-      /* storage unavailable */
-    }
-  },
+  pushHistory: (m) => saveHistory([m, ...get().history.filter((h) => h.id !== m.id)].slice(0, 12)),
+  removeHistory: (id) => saveHistory(get().history.filter((h) => h.id !== id)),
   set: (p) => {
     set(p);
     if (p.audioPrefs) {
@@ -235,12 +290,19 @@ export function syncAllParams() {
 // ---------------------------------------------------------------- clock --
 // Ticks arrive ~30×/s; animation interpolates between them.
 
-const clock = { pos: 0, at: 0, playing: false };
+const clock = { pos: 0, at: 0, playing: false, shown: 0 };
+
+/** Backward steps smaller than this are tick jitter, not a seek. */
+const JITTER = 0.25;
 
 export function songTime(): number {
-  if (!clock.playing) return clock.pos;
+  if (!clock.playing) return (clock.shown = clock.pos);
   // The engine plays the rendered (tempo-adjusted) track in real time.
-  return clock.pos + Math.min(0.12, (performance.now() - clock.at) / 1000);
+  const t = clock.pos + Math.min(0.12, (performance.now() - clock.at) / 1000);
+  // Extrapolating between ticks runs a few ms ahead of the next tick; never
+  // step back for that, or lyrics flicker between lines at every boundary.
+  if (t < clock.shown && clock.shown - t < JITTER) return clock.shown;
+  return (clock.shown = t);
 }
 
 // ---------------------------------------------------------------- pitch --
@@ -251,6 +313,15 @@ const PITCH_HOP = 0.004;
 
 export function resetPitchTrail() {
   pitchTrail.length = 0;
+}
+
+/** Where singing starts and stops in playback seconds, after the song's trim. */
+export function trimRange(s: Pick<Store, "song" | "duration"> = useStore.getState()): { start: number; end: number } {
+  const tempo = s.song?.info?.tempo || 1;
+  const trim = s.song?.trim;
+  const start = (trim?.start ?? 0) / tempo;
+  const end = trim?.end ? Math.max(start, s.duration - trim.end / tempo) : s.duration;
+  return { start, end };
 }
 
 export function handleTick(t: Tick) {
@@ -270,7 +341,11 @@ export function handleTick(t: Tick) {
   if (Math.abs(s.pos - t.pos) > 0.05) patch.pos = t.pos;
   if (s.duration !== t.duration) patch.duration = t.duration;
   if (s.playing !== t.playing) patch.playing = t.playing;
-  if (s.ended !== t.ended) patch.ended = t.ended;
+  // Past the trimmed end (an ad, an outro): stop as if the song had ended.
+  const cut = !!s.song?.trim?.end && t.duration > 0 && t.pos >= trimRange({ song: s.song, duration: t.duration }).end - 0.05;
+  if (cut && t.playing) void api.pause();
+  const ended = t.ended || cut;
+  if (s.ended !== ended) patch.ended = ended;
   if (s.recording !== t.recording) patch.recording = t.recording;
   if (s.buffering !== t.buffering) patch.buffering = t.buffering;
   if (Math.abs(s.ready - t.ready) > 0.5) patch.ready = t.ready;

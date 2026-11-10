@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, onDownloadProgress, onTick } from "./lib/api";
+import { cancelExport } from "./lib/exportJob";
 import { closeSong, listenForSeparation } from "./lib/loader";
 import { handleTick, useStore } from "./lib/store";
 import { Back, Expand, Mic, Panel, Settings as SettingsIcon } from "./components/Icons";
@@ -8,7 +9,7 @@ import { Search } from "./components/Search";
 import { openAudio, Settings } from "./components/Settings";
 import { Setup } from "./components/Setup";
 import { Stage } from "./components/Stage";
-import { togglePlay } from "./components/Transport";
+import { toggleMic, togglePlay } from "./components/Transport";
 import { VoiceLab } from "./components/VoiceLab";
 
 const isMac = navigator.userAgent.includes("Mac");
@@ -18,17 +19,17 @@ function WindowControls() {
   const w = getCurrentWindow();
   return (
     <div className="win-controls">
-      <button onClick={() => w.minimize()} title="Minimize">
+      <button onClick={() => w.minimize()} title="Thu nhỏ">
         <svg viewBox="0 0 12 12" stroke="currentColor" strokeWidth="1.2">
           <path d="M2 6h8" />
         </svg>
       </button>
-      <button onClick={() => w.toggleMaximize()} title="Maximize">
+      <button onClick={() => w.toggleMaximize()} title="Phóng to">
         <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.2">
           <rect x="2" y="2" width="8" height="8" rx="1.5" />
         </svg>
       </button>
-      <button className="close" onClick={() => w.close()} title="Close">
+      <button className="close" onClick={() => w.close()} title="Đóng">
         <svg viewBox="0 0 12 12" stroke="currentColor" strokeWidth="1.2">
           <path d="m2.5 2.5 7 7m0-7-7 7" />
         </svg>
@@ -49,7 +50,7 @@ function TitleBar() {
   return (
     <div className={`titlebar ${isMac ? "" : "win"}`} data-tauri-drag-region>
       {view === "stage" || view === "lab" ? (
-        <button className="icon-btn" onClick={view === "lab" ? () => set({ view: "search" }) : closeSong} title="Back to search (Esc)">
+        <button className="icon-btn" onClick={view === "lab" ? () => set({ view: "search" }) : closeSong} title="Về trang tìm kiếm (Esc)">
           <Back />
         </button>
       ) : (
@@ -60,26 +61,44 @@ function TitleBar() {
       )}
       <div className="spacer" data-tauri-drag-region />
       {view === "search" && (
-        <button className="btn small" onClick={() => set({ view: "lab" })} title="Test your sound">
-          <Mic /> Voice Lab
+        <button className="btn small" onClick={() => set({ view: "lab" })} title="Thử giọng">
+          <Mic /> Thử giọng
         </button>
       )}
       {(view === "stage" || view === "lab") && (
         <>
-          <button className="icon-btn" onClick={toggleFullscreen} title="Fullscreen (F)">
+          <button className="icon-btn" onClick={toggleFullscreen} title="Toàn màn hình (F)">
             <Expand />
           </button>
-          <button className={`icon-btn ${sidebar ? "active" : ""}`} onClick={() => set({ sidebar: !sidebar })} title="Toggle controls (Tab)">
+          <button className={`icon-btn ${sidebar ? "active" : ""}`} onClick={() => set({ sidebar: !sidebar })} title="Ẩn/hiện bảng điều khiển (Tab)">
             <Panel />
           </button>
         </>
       )}
       {view !== "setup" && view !== "boot" && (
-        <button className="icon-btn" onClick={() => set({ settingsOpen: true })} title="Audio setup">
+        <button className="icon-btn" onClick={() => set({ settingsOpen: true })} title="Cài đặt âm thanh">
           <SettingsIcon />
         </button>
       )}
       {!isMac && <WindowControls />}
+    </div>
+  );
+}
+
+/** A karaoke video being exported: shown in a corner whatever view is open. */
+function ExportPill() {
+  const job = useStore((s) => s.exportJob);
+  if (!job) return null;
+  return (
+    <div className="export-pill" title={job.title}>
+      <span className="spinner" style={{ width: 12, height: 12, borderWidth: 1.5 }} />
+      <span className="export-pill-text">
+        Đang xuất video <b>{Math.round(job.progress * 100)}%</b>
+      </span>
+      <div className="export-pill-bar">
+        <div style={{ width: `${job.progress * 100}%` }} />
+      </div>
+      <button onClick={cancelExport}>Hủy</button>
     </div>
   );
 }
@@ -146,6 +165,10 @@ function useShortcuts() {
         case "]":
           nudge(0.1);
           break;
+        case "m":
+        case "M":
+          toggleMic();
+          break;
         case "f":
         case "F":
           void toggleFullscreen();
@@ -196,6 +219,7 @@ export default function App() {
       {view === "stage" && <Stage />}
       {view === "lab" && <VoiceLab />}
       <Settings />
+      <ExportPill />
       <Toasts />
     </div>
   );

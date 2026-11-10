@@ -46,9 +46,9 @@ fn friendly_error(stderr: &str) -> String {
         .trim_start_matches("ERROR:")
         .trim();
     if line.contains("Sign in to confirm") {
-        "YouTube is rate-limiting this network. Wait a few minutes and try again.".into()
+        "YouTube đang giới hạn mạng này. Đợi vài phút rồi thử lại.".into()
     } else if line.contains("Private video") || line.contains("unavailable") {
-        "That video is unavailable. Pick another source.".into()
+        "Video này không xem được. Hãy chọn bản thu khác.".into()
     } else {
         line.to_string()
     }
@@ -60,7 +60,7 @@ pub async fn search(tools: &Path, query: &str, limit: u32) -> Result<Vec<Video>,
         .arg(format!("ytsearch{}:{}", limit.clamp(1, 30), query))
         .output()
         .await
-        .map_err(|e| format!("Could not run yt-dlp: {e}"))?;
+        .map_err(|e| format!("Không chạy được yt-dlp: {e}"))?;
     if !out.status.success() {
         return Err(friendly_error(&String::from_utf8_lossy(&out.stderr)));
     }
@@ -105,18 +105,51 @@ struct DownloadProgress<'a> {
 }
 
 /// Download the audio of a video into `cache` and return its path.
-pub async fn download(app: &AppHandle, tools: &Path, cache: &Path, id: &str) -> Result<PathBuf, String> {
+fn valid_id(id: &str) -> Result<(), String> {
     if id.len() != 11 || !id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-        return Err("Invalid video id".into());
+        return Err("Mã video không hợp lệ".into());
     }
+    Ok(())
+}
+
+/// The recording's audio, from the cache or downloaded.
+pub async fn download(app: &AppHandle, tools: &Path, cache: &Path, id: &str) -> Result<PathBuf, String> {
+    valid_id(id)?;
     if let Some(p) = cached(cache, id) {
         return Ok(p);
     }
+    // AAC first: it decodes everywhere without extra codecs.
+    let format = "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/140/bestaudio[ext=mp3]/bestaudio";
+    fetch(app, tools, cache, id, format, "%(id)s.%(ext)s", "download://progress")
+        .await?
+        .or_else(|| cached(cache, id))
+        .ok_or_else(|| "yt-dlp finished but no audio file was produced".into())
+}
+
+/// The recording's video, picture only (the sound comes from the audio),
+/// up to 1080p, in MP4 so the webview can both play and decode it. H.264
+/// first, as every machine decodes it in hardware.
+pub async fn download_video(app: &AppHandle, tools: &Path, cache: &Path, id: &str) -> Result<PathBuf, String> {
+    valid_id(id)?;
+    let path = cache.join(format!("{id}.video.mp4"));
+    if path.is_file() {
+        return Ok(path);
+    }
+    let format = "bv*[vcodec^=avc1][height<=1080][ext=mp4]/bv*[height<=1080][ext=mp4]/bv*[ext=mp4]";
+    fetch(app, tools, cache, id, format, "%(id)s.video.%(ext)s", "download://video-progress")
+        .await?
+        .filter(|p| p.is_file())
+        .or_else(|| path.is_file().then(|| path.clone()))
+        .ok_or_else(|| "YouTube không có video MP4 cho bài này".into())
+}
+
+/// Run yt-dlp for one format into the cache, reporting progress as
+/// `event`. Returns the file it wrote.
+async fn fetch(app: &AppHandle, tools: &Path, cache: &Path, id: &str, format: &str, name: &str, event: &str) -> Result<Option<PathBuf>, String> {
     tokio::fs::create_dir_all(cache).await.map_err(|e| e.to_string())?;
-    let template = cache.join("%(id)s.%(ext)s");
+    let template = cache.join(name);
     let mut child = command(tools)
-        // AAC first: it decodes everywhere without extra codecs.
-        .args(["-f", "bestaudio[ext=m4a]/bestaudio[acodec^=mp4a]/140/bestaudio[ext=mp3]/bestaudio"])
+        .args(["-f", format])
         .args(["--no-playlist", "--newline", "--progress"])
         .args(["--progress-template", "download:ENC %(progress.downloaded_bytes)s %(progress.total_bytes)s %(progress.total_bytes_estimate)s"])
         .args(["--print", "after_move:ENCFILE %(filepath)s"])
@@ -126,7 +159,7 @@ pub async fn download(app: &AppHandle, tools: &Path, cache: &Path, id: &str) -> 
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("Could not run yt-dlp: {e}"))?;
+        .map_err(|e| format!("Không chạy được yt-dlp: {e}"))?;
 
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
@@ -149,7 +182,7 @@ pub async fn download(app: &AppHandle, tools: &Path, cache: &Path, id: &str) -> 
             if nums.len() == 3 {
                 let total = if nums[1].is_finite() { nums[1] } else { nums[2] };
                 if total.is_finite() && total > 0.0 && nums[0].is_finite() {
-                    let _ = app.emit("download://progress", DownloadProgress { id, fraction: (nums[0] / total).min(1.0) });
+                    let _ = app.emit(event, DownloadProgress { id, fraction: (nums[0] / total).min(1.0) });
                 }
             }
         }
@@ -159,9 +192,7 @@ pub async fn download(app: &AppHandle, tools: &Path, cache: &Path, id: &str) -> 
     if !status.success() {
         return Err(friendly_error(&stderr));
     }
-    file.filter(|f| f.is_file())
-        .or_else(|| cached(cache, id))
-        .ok_or_else(|| "yt-dlp finished but no audio file was produced".into())
+    Ok(file.filter(|f| f.is_file()))
 }
 
 /// Keep the cache from growing without bound (oldest files go first).
