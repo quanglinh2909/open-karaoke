@@ -1,3 +1,5 @@
+import { LyricsEditor } from "./components/LyricsEditor";
+import { PartsEditor } from "./components/PartsEditor";
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { api, onDownloadProgress, onTick } from "./lib/api";
@@ -132,8 +134,11 @@ function useShortcuts() {
     const onKey = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" && (target as HTMLInputElement).type !== "range") return;
-      if (target.tagName === "SELECT") return;
+      // Typing lyrics must not play, mute or close the song.
+      if (target.tagName === "SELECT" || target.tagName === "TEXTAREA" || target.isContentEditable) return;
       const s = useStore.getState();
+      // The editor pages handle their own keys (Escape closes them).
+      if (s.lyricsEditor || s.partsEditor) return;
       if (s.view === "lab") {
         if (e.key === "Escape") {
           if (s.settingsOpen) s.set({ settingsOpen: false });
@@ -219,6 +224,8 @@ export default function App() {
       {view === "stage" && <Stage />}
       {view === "lab" && <VoiceLab />}
       <Settings />
+      <LyricsEditor />
+      <PartsEditor />
       <ExportPill />
       <Toasts />
     </div>

@@ -176,10 +176,7 @@ pub struct Separator {
 impl Separator {
     pub fn load(model: &Path, spec: MdxConfig) -> Result<Self, String> {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let env = ort::init()
-            .with_name("open-karaoke")
-            .build()
-            .map_err(|e| format!("Không khởi động được ONNX Runtime: {e}"))?;
+        let env = super::ort_env()?;
         let fail = |e: &dyn std::fmt::Display| format!("Không tải được mô hình tách giọng: {e}");
         let session = Session::builder(&env)
             .map_err(|e| fail(&e))?

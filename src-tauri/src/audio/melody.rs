@@ -73,10 +73,7 @@ pub struct Tracker {
 #[cfg(has_ort)]
 impl Tracker {
     pub fn load(model: &Path) -> Result<Self, String> {
-        let env = ort::init()
-            .with_name("open-karaoke-melody")
-            .build()
-            .map_err(|e| format!("Không khởi động được ONNX Runtime: {e}"))?;
+        let env = super::ort_env()?;
         let fail = |e: &dyn std::fmt::Display| format!("Không tải được mô hình dò giai điệu: {e}");
         // More than a few threads don't help a model this small.
         let session = Session::builder(&env)

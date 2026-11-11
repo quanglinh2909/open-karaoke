@@ -1,10 +1,12 @@
 import { useEffect, useRef, useState } from "react";
-import { loadVideo, rememberTransform, switchSource, switchToVocalRemover, transform } from "../lib/loader";
+import { api, errorText, type BackingStyle, type LyricCandidate } from "../lib/api";
+import { backingChoice, hasFixes, lyricIssues, loadVideo, startLyrics, onBackingChange, setBacking, songParts, lyricsBusy, lyricsPick, refitWithFixes, lyricsSearch, rememberLyricsSearch, rememberTransform, replaceLyrics, switchSource, switchToVocalRemover, transform } from "../lib/loader";
 import { formatTime, HARMONIES, keyName, NOTE_NAMES, SCALES } from "../lib/music";
 import { FX_PRESETS, SOUND_KEYS, TUNE_PRESETS, type Preset } from "../lib/presets";
 import { useStore, type Tab } from "../lib/store";
+import { songFromVideo } from "../lib/sources";
 import { cancelExport, startExport } from "../lib/exportJob";
-import type { LyricStyle, Orientation } from "../lib/videoExport";
+import type { Backdrop, LyricStyle, Orientation } from "../lib/videoExport";
 import { db, Group, ms, ParamSlider, ParamToggle, pct, Segmented, Select, semis, Slider, Toggle } from "./Controls";
 
 function matches(values: Record<string, number>, params: Record<string, number>) {
@@ -230,6 +232,8 @@ export function MixPanel() {
         )}
         <ParamSlider name="master" label="Tổng" min={0} max={1.2} format={pct} reset={0.9} />
       </Group>
+      {hasGuide && !vocalRemoved && <PartsGroup />}
+      {hasGuide && !vocalRemoved && <BackingGroup />}
       <Group title="Nghe lại">
         <ParamToggle name="monitor" label="Nghe giọng mình" hint="Dùng tai nghe để tránh bị hú qua loa" />
       </Group>
@@ -301,6 +305,8 @@ export function SongPanel() {
       <VideoGroup />
 
       <TrimGroup />
+
+      <LyricsGroup />
 
       <Group title="Canh lời" extra={!info?.vocalRemoved && info && <span className="badge">Khớp bản gốc</span>}>
         <div className="stepper">
@@ -383,6 +389,23 @@ function ExportVideo() {
       /* storage unavailable */
     }
   };
+  // The background too: the recording's own video unless the artwork is chosen.
+  const [backdrop, setBackdropState] = useState<Backdrop>(() => {
+    try {
+      const v = localStorage.getItem("openkaraoke.exportBackdrop.v1");
+      return v === "artwork" || v === "plain" ? v : "video";
+    } catch {
+      return "video";
+    }
+  });
+  const setBackdrop = (v: Backdrop) => {
+    setBackdropState(v);
+    try {
+      localStorage.setItem("openkaraoke.exportBackdrop.v1", v);
+    } catch {
+      /* storage unavailable */
+    }
+  };
   const ready = !!song?.info && !song.info.separating && song.phase === "ready";
   const progress = job?.progress ?? null;
 
@@ -414,8 +437,26 @@ function ExportVideo() {
             ? "Hai dòng ở dưới, trên trái dưới phải, luân phiên như đầu karaoke."
             : "Câu đang hát ở đáy màn hình, chừa trọn khung hình cho video."}
       </p>
+      <div style={{ marginTop: 10 }}>
+        <Segmented
+          value={backdrop}
+          onChange={setBackdrop}
+          options={[
+            { label: "Video gốc", value: "video" },
+            { label: "Ảnh bài hát", value: "artwork" },
+            { label: "Mặc định", value: "plain" },
+          ]}
+        />
+      </div>
+      <p className="help" style={{ marginTop: 6 }}>
+        {backdrop === "video"
+          ? `Video gốc của bản thu, Full HD${song?.video?.status === "ready" ? "" : " (tải về khi xuất)"}.`
+          : backdrop === "artwork"
+            ? "Ảnh bìa bài hát làm mờ, Full HD."
+            : "Nền tối mặc định của ứng dụng, không dùng hình nào, Full HD."}
+      </p>
       {progress === null ? (
-        <button className="btn primary" style={{ width: "100%", marginTop: 12 }} disabled={!ready} onClick={() => void startExport(orientation, style)}>
+        <button className="btn primary" style={{ width: "100%", marginTop: 12 }} disabled={!ready} onClick={() => void startExport(orientation, style, backdrop)}>
           Xuất video
         </button>
       ) : (
@@ -436,6 +477,260 @@ function ExportVideo() {
       <p className="help">
         Nhạc nền đã tách giọng (đúng tông và nhịp độ đang chỉnh) cùng lời chạy chữ, lưu thành MP4 trong thư mục bản thu.
         {!ready && " Dùng được khi bài đã tách giọng xong."}
+      </p>
+    </Group>
+  );
+}
+
+/**
+ * Pick the right lyrics by hand: search LRCLIB under the real title and
+ * artist (the automatic lookup guesses them from the video title), or paste
+ * lyrics. Choosing them fits them to the singer again.
+ */
+function LyricsGroup() {
+  const song = useStore((s) => s.song);
+  const aligning = useStore((s) => !!s.song?.aligning);
+  const [title, setTitle] = useState("");
+  const [artist, setArtist] = useState("");
+  const [results, setResults] = useState<LyricCandidate[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const songId = song?.meta.id;
+
+  useEffect(() => {
+    // What the user searched for last time, else the song's own names.
+    // Songs saved before the title parsing improved: parse their video again.
+    const meta = song?.meta.video ? songFromVideo(song.meta.video) : song?.meta;
+    const q = songId ? lyricsSearch(songId) : null;
+    setTitle(q?.title ?? meta?.title ?? "");
+    setArtist(q?.artist ?? meta?.artist ?? "");
+    setResults(null);
+    setError(null);
+    // Reset only when another song opens.
+  }, [songId]);
+
+  if (!song) return null;
+  const recording = song.originals.find((r) => r.video.id === song.sourceId)?.video.duration ?? song.meta.duration;
+  const busy = aligning || lyricsBusy();
+  const ly = song.lyrics;
+  const picked = lyricsPick(song.meta.id);
+  const current = ly.status === "loading" ? "Đang tìm…" : ly.lines ? `${ly.lines.length} dòng, có mốc thời gian` : ly.plain ? "Lời thường (chưa có mốc thời gian)" : ly.instrumental ? "Nhạc không lời" : "Chưa có lời";
+
+  const search = async () => {
+    if (!title.trim()) return;
+    rememberLyricsSearch(song.meta.id, title, artist);
+    setSearching(true);
+    setError(null);
+    try {
+      setResults(await api.searchLyrics(title, artist, recording ?? 0));
+    } catch (e) {
+      setError(errorText(e));
+      setResults(null);
+    } finally {
+      setSearching(false);
+    }
+  };
+  const openEditor = (mode: "edit" | "new") => useStore.getState().set({ lyricsEditor: mode });
+  const use = (l: LyricCandidate["lyrics"], label: string) => {
+    if (!replaceLyrics(l, { label, title: title.trim(), artist: artist.trim() })) return;
+    setResults(null);
+  };
+
+
+  return (
+    <Group title="Lời bài hát" extra={<span className="badge muted">{current}</span>}>
+      <div className="name-row">
+        <input className="text-input" placeholder="Tên bài đúng" value={title} onChange={(e) => setTitle(e.target.value)} onKeyDown={(e) => e.key === "Enter" && search()} />
+      </div>
+      <div className="name-row" style={{ marginTop: 6 }}>
+        <input className="text-input" placeholder="Ca sĩ (không bắt buộc)" value={artist} onChange={(e) => setArtist(e.target.value)} onKeyDown={(e) => e.key === "Enter" && search()} />
+        <button className="btn small primary" onClick={search} disabled={searching || !title.trim()}>
+          {searching ? "Đang tìm…" : "Tìm lời"}
+        </button>
+      </div>
+      <p className="help" style={{ marginTop: 6 }}>
+        Đang dùng: {picked ? <b>{picked.label}</b> : "lời app tự tìm"}.
+      </p>
+      {error && <p className="help err">Không tìm được: {error}</p>}
+      {results && !results.length && <p className="help">Không có kết quả. Thử bỏ tên ca sĩ, viết tên bài khác đi, hoặc dán lời.</p>}
+      {results && results.length > 0 && (
+        <div style={{ marginTop: 8, maxHeight: 280, overflowY: "auto" }}>
+          {results.map((c, i) => {
+            const off = recording && c.duration ? Math.round(c.duration - recording) : null;
+            return (
+              <button key={i} className="source" disabled={busy} onClick={() => use(c.lyrics, `${c.track} – ${c.artist} (${formatTime(c.duration)})`)} title={(c.lyrics.synced ?? c.lyrics.plain ?? "").slice(0, 400)}>
+                <div style={{ minWidth: 0 }}>
+                  <div className="st">{c.track}</div>
+                  <div className="sc">
+                    {c.artist}
+                    {c.album ? ` · ${c.album}` : ""} · {formatTime(c.duration)}
+                    {off !== null && off !== 0 ? ` (${off > 0 ? "+" : ""}${off}s)` : ""} · {c.lyrics.synced ? "có mốc thời gian" : "lời thường"}
+                  </div>
+                </div>
+              </button>
+            );
+          })}
+        </div>
+      )}
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 8 }}>
+        <button className="badge muted" style={{ cursor: "pointer" }} onClick={() => openEditor(ly.lines || ly.plain ? "edit" : "new")}>
+          ✎ {ly.lines || ly.plain ? "Sửa toàn bộ lời" : "Viết lời cho bài này"}
+        </button>
+        {(ly.lines || ly.plain) && (
+          <button className="badge muted" style={{ cursor: "pointer" }} onClick={() => openEditor("new")}>
+            + Dán lời mới
+          </button>
+        )}
+        {hasFixes() && (
+          <button className="badge muted" style={{ cursor: "pointer" }} disabled={busy} onClick={() => refitWithFixes()}>
+            ↻ Canh lại theo chữ đã sửa
+          </button>
+        )}
+      </div>
+      <FitGroup />
+      <p className="help">
+        Lời đúng bài là điều quan trọng nhất để khớp chính xác: AI nghe giọng ca sĩ rồi ghép với lời này, giữ chính tả của lời và sửa chỗ ca sĩ hát khác.
+        {busy ? " Đang khớp lời, đổi lời sau khi xong." : " Chọn lời xong, app khớp lại theo giọng ca sĩ."}
+      </p>
+    </Group>
+  );
+}
+
+/** Where the original singer sings (a duet's other voice) and where the harmony plays. */
+function PartsGroup() {
+  const song = useStore((s) => s.song);
+  const set = useStore((s) => s.set);
+  // Re-read after the editor saves.
+  useStore((s) => s.partsEditor);
+  if (!song) return null;
+  const parts = songParts(song.meta.id);
+  const canPick = !!song.lyrics.lines && !song.info?.separating;
+  return (
+    <Group title="Giọng gốc theo đoạn">
+      <button className="btn small" style={{ width: "100%", marginBottom: 10 }} disabled={!canPick} onClick={() => set({ partsEditor: true })}>
+        ✂ Chọn đoạn theo dòng lời…
+      </button>
+      {parts.original.length > 0 && (
+        <ParamSlider name="lead" label="Giọng gốc ở đoạn đã chọn" min={0} max={1.2} format={pct} reset={0.85} />
+      )}
+      <p className="help">
+        {parts.original.length
+          ? `Ca sĩ gốc hát ${parts.original.length} đoạn; bạn hát phần còn lại. `
+          : "Bài song ca: chọn phần của giọng kia để ca sĩ gốc tự hát, bạn hát phần mình. "}
+        {parts.backing.length ? `Bè chỉ có ở ${parts.backing.length} đoạn đã chọn.` : "Bè (nếu bật) có cả bài."}
+        {!song.lyrics.lines && " Cần lời theo thời gian để chọn đoạn."}
+      </p>
+    </Group>
+  );
+}
+
+/** Fit again (fast, or heard by Whisper), and the lines the last fit could hardly place. */
+function FitGroup() {
+  const song = useStore((s) => s.song);
+  const aligning = useStore((s) => !!s.song?.aligning);
+  if (!song) return null;
+  const ready = !!song.sourceId && !!song.info && !song.info.separating && !song.info.vocalRemoved;
+  const issues = lyricIssues(song.meta.id);
+  const tempo = song.info?.tempo ?? 1;
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+        <button className="badge muted" style={{ cursor: "pointer" }} disabled={!ready || aligning} onClick={() => startLyrics(song.meta.id, "fast")} title="Canh theo giọng ca sĩ bằng MMS, khoảng 1 phút">
+          ▶ Khớp nhanh
+        </button>
+        <button className="badge muted" style={{ cursor: "pointer" }} disabled={!ready || aligning} onClick={() => startLyrics(song.meta.id, "whisper")} title="Whisper nghe cả bài rồi mới canh, khoảng 6–7 phút">
+          ▶ Khớp kỹ (Whisper)
+        </button>
+      </div>
+      {issues.length > 0 && (
+        <div style={{ marginTop: 8 }}>
+          <div className="help" style={{ marginBottom: 4 }}>
+            <b>Dòng cần kiểm tra</b> ({issues.length}): canh có thể sai. Bấm để nghe; sửa bằng ✎ Sửa lời hoặc thử Khớp kỹ.
+          </div>
+          {issues.map((it, k) => (
+            <button
+              key={k}
+              className="source"
+              onClick={() => void api.seek(Math.max(0, (it.start + song.userOffset - 1) / tempo))}
+              title={`Điểm canh ${it.score}`}
+            >
+              <div style={{ minWidth: 0 }}>
+                <div className="st">⚠ {it.text}</div>
+                <div className="sc">{formatTime(it.start)}</div>
+              </div>
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+const BACKINGS: { label: string; value: string }[] = [
+  { label: "Tắt", value: "" },
+  { label: "Quãng 3 trên", value: "2" },
+  { label: "Quãng 3 dưới", value: "-2" },
+  { label: "Quãng 3 trên + quãng 3 dưới", value: "2,-2" },
+  { label: "Quãng 5 dưới", value: "-4" },
+];
+
+/** A harmony made from the original singer's separated vocal, on stage and in exported videos. */
+function BackingGroup() {
+  const busy = useStore((s) => s.song?.busy ?? null);
+  const separating = useStore((s) => !!s.song?.info?.separating);
+  const [choice, setChoice] = useState(() => backingChoice().degrees.join(","));
+  const [style, setStyle] = useState<BackingStyle>(() => backingChoice().style);
+  const apply = (c: string, st: BackingStyle) => void setBacking(c ? c.split(",").map(Number) : [], st);
+  // Each song has its own: show this one's when another song opens.
+  const songId = useStore((s) => s.song?.meta.id);
+  useEffect(() => {
+    setChoice(backingChoice().degrees.join(","));
+    setStyle(backingChoice().style);
+  }, [songId]);
+  // Turned on from the parts page: show it.
+  useEffect(
+    () =>
+      onBackingChange(() => {
+        setChoice(backingChoice().degrees.join(","));
+        setStyle(backingChoice().style);
+      }),
+    [],
+  );
+  return (
+    <Group title="Bè tự động">
+      <div style={{ marginBottom: 12, opacity: separating ? 0.45 : 1, pointerEvents: separating ? "none" : undefined }}>
+        <Select
+          value={choice}
+          options={BACKINGS}
+          onChange={(v) => {
+            setChoice(v);
+            apply(v, style);
+          }}
+        />
+      </div>
+      {choice && (
+        <div style={{ marginBottom: 12 }}>
+          <Segmented
+            value={style}
+            options={[
+              { label: "Hợp xướng “ooh”", value: "choir" },
+              { label: "Giọng ca sĩ", value: "voice" },
+            ]}
+            onChange={(v) => {
+              setStyle(v);
+              apply(choice, v);
+            }}
+          />
+        </div>
+      )}
+      {choice && <ParamSlider name="backing" label="Mức bè" min={0} max={1} format={pct} reset={0.35} />}
+      <p className="help">
+        {style === "choir"
+          ? "Một nhóm giọng tổng hợp ngân “ooh” theo giai điệu, đúng thang âm của bài: sạch, không vỡ tiếng."
+          : "Giọng ca sĩ gốc được dịch thành bè, có lời nhưng có thể rè ở chỗ giọng tách chưa sạch."}{" "}
+        Không cần micro; bè được trộn vào nhạc nền khi hát và có trong video xuất ra.
+        {separating && " Dùng được khi AI tách giọng xong."}
+        {busy === "Đang tạo bè…" && " Đang tạo bè…"}
       </p>
     </Group>
   );

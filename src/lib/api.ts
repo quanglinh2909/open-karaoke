@@ -34,6 +34,18 @@ export interface Lyrics {
   instrumental: boolean;
 }
 
+/** The automatic harmony: a synthesised "ooh" choir, or the singer's own voice shifted. */
+export type BackingStyle = "choir" | "voice";
+
+/** One published lyrics entry (LRCLIB), for picking by hand. */
+export interface LyricCandidate {
+  track: string;
+  artist: string;
+  album: string;
+  duration: number;
+  lyrics: Lyrics;
+}
+
 export interface Video {
   id: string;
   title: string;
@@ -158,6 +170,14 @@ export const api = {
   toolsStatus: () => invoke<ToolStatus>("tools_status"),
   toolsInstall: () => invoke<ToolStatus>("tools_install"),
   searchSongs: (query: string) => invoke<SongMeta[]>("search_songs", { query }),
+  /** Make the automatic harmony from the separated vocal (scale steps; none = off). */
+  songBacking: (degrees: number[], style: BackingStyle) => invoke<void>("song_backing", { degrees, style }),
+  /** Parts (seconds in the recording) that get the harmony, and parts the original singer sings. */
+  /** `original`: [start, fullFrom, fullTo, end]; outside fullFrom–fullTo only the sung pitch is kept. */
+  songParts: (backing: [number, number][], original: [number, number, number, number, number, number][]) =>
+    invoke<void>("song_parts", { backing, original }),
+  searchLyrics: (title: string, artist: string, duration: number) =>
+    invoke<LyricCandidate[]>("search_lyrics", { title, artist, duration }),
   getLyrics: (m: SongMeta) =>
     invoke<Lyrics>("get_lyrics", { artist: m.artist, title: m.title, album: m.album, duration: m.duration }),
   ytSearch: (query: string, limit = 10) => invoke<Video[]>("yt_search", { query, limit }),
@@ -170,12 +190,15 @@ export const api = {
   vocalActivity: () => invoke<number[] | null>("vocal_activity"),
   /** Forced alignment of romanized lyric words against the separated vocal. */
   /** `windows`: where speech recognition heard each line [start, end] (seconds), or null. */
-  alignLyrics: (source: string, lines: string[][], windows: ([number, number] | null)[] = []) =>
-    invoke<(WordTime | null)[][]>("align_lyrics", { source, lines, windows }),
+  /** `lrc`: each line's published time (LRC), which guides lines the aligner misplaces; null without one. */
+  alignLyrics: (source: string, lines: string[][], windows: ([number, number] | null)[] = [], lrc: (number | null)[] | null = null) =>
+    invoke<(WordTime | null)[][]>("align_lyrics", { source, lines, windows, lrc }),
   /** What the singer actually sings, heard by Whisper; `prompt` (the published lyrics) primes it. */
   /** The original singer's melody, from the separated vocal (about a second, then cached). */
   melodyNotes: (source: string) => invoke<MelodyNote[]>("melody_notes", { source }),
-  transcribeVocal: (source: string, prompt: string | null) => invoke<HeardLine[]>("transcribe_vocal", { source, prompt }),
+  /** `language`: "vi", or null for Whisper to detect it. */
+  transcribeVocal: (source: string, prompt: string | null, language: string | null) =>
+    invoke<HeardLine[]>("transcribe_vocal", { source, prompt, language }),
   /** Lyric analyses waiting or running for these recordings. */
   lyricJobs: (sources: string[]) => invoke<LyricJob[]>("lyric_jobs", { sources }),
   /** Stop a recording's lyric analysis (queued or running) so others go first. */

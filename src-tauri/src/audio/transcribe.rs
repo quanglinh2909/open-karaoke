@@ -16,7 +16,15 @@ pub struct ModelInfo {
     pub sha256: &'static str,
 }
 
+/// Whisper large-v2 fine-tuned on ~550 h of Vietnamese songs (Apache-2.0,
+/// kelvinbksoh/whisper-large-v2-vietnamese-lyrics-transcription, arXiv
+/// 2510.22295: WER 24.6 on sung Vietnamese vs 38.3 for PhoWhisper-large).
+/// There is no published ggml build: `scripts/convert_whisper_hf.py` makes
+/// this file, and Vietnamese songs use it when it is in the models dir.
+pub const MODEL_VI_LYRICS: &str = "ggml-vi-lyrics-large-v2-q5_0.bin";
+
 /// Whisper large-v3-turbo, 5-bit quantized (MIT), pinned to a revision.
+/// Used for songs in other languages, and for Vietnamese without `MODEL_VI_LYRICS`.
 pub const MODEL: ModelInfo = ModelInfo {
     file: "ggml-large-v3-turbo-q5_0.bin",
     url: "https://huggingface.co/ggerganov/whisper.cpp/resolve/5359861c739e955e79d9a303bcbc70fb988958b1/ggml-large-v3-turbo-q5_0.bin",
@@ -75,6 +83,7 @@ pub fn transcribe(
     model: &Path,
     audio: &[f32],
     prompt: Option<&str>,
+    language: Option<&str>,
     mut progress: impl FnMut(f32, f32),
     cancelled: impl Fn() -> bool,
 ) -> Result<Vec<HeardLine>, String> {
@@ -98,7 +107,8 @@ pub fn transcribe(
         // Greedy: with the lyrics as prompt it hears as well as beam search, several times faster.
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 2 });
         params.set_n_threads(threads);
-        params.set_language(Some("vi"));
+        // None: Whisper detects the language of each chunk.
+        params.set_language(Some(language.unwrap_or("auto")));
         params.set_token_timestamps(true);
         params.set_no_context(true);
         params.set_suppress_blank(true);

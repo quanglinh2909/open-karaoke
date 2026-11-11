@@ -206,6 +206,74 @@ pub async fn lyrics(artist: &str, title: &str, album: &str, duration: f64) -> Re
     Ok(best.map(|b| b.1).unwrap_or_default())
 }
 
+/// One LRCLIB entry, for the user to pick when the automatic match is wrong.
+#[derive(Serialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct LyricCandidate {
+    pub track: String,
+    pub artist: String,
+    pub album: String,
+    /// Seconds (0 if unknown).
+    pub duration: f64,
+    pub lyrics: Lyrics,
+}
+
+/// Every LRCLIB entry for a title (and artist, if given), synced lyrics and
+/// those closest to `duration` first. Unlike `lyrics`, nothing is chosen.
+pub async fn search_lyrics(title: &str, artist: &str, duration: f64) -> Result<Vec<LyricCandidate>, String> {
+    let client = http();
+    let (title, artist) = (title.trim(), artist.trim());
+    if title.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut queries = vec![vec![("track_name", title.to_string())]];
+    if !artist.is_empty() {
+        queries[0].push(("artist_name", artist.to_string()));
+        queries.push(vec![("q", format!("{artist} {title}"))]);
+    }
+    queries.push(vec![("q", title.to_string())]);
+
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    for query in queries {
+        let resp = client.get("https://lrclib.net/api/search").query(&query).send().await.map_err(|e| e.to_string())?;
+        if !resp.status().is_success() {
+            continue;
+        }
+        let arr: Value = resp.json().await.map_err(|e| e.to_string())?;
+        for item in arr.as_array().map(|a| a.as_slice()).unwrap_or_default() {
+            let lyrics = to_lyrics(item);
+            if lyrics.synced.is_none() && lyrics.plain.is_none() {
+                continue;
+            }
+            // The same lyrics are often uploaded many times: keep one of each.
+            let text = lyrics.synced.as_deref().or(lyrics.plain.as_deref()).unwrap_or("");
+            let body: String = text.chars().filter(|c| c.is_alphanumeric()).flat_map(char::to_lowercase).collect();
+            if !seen.insert(body) {
+                continue;
+            }
+            let s = |k: &str| item[k].as_str().unwrap_or("").to_string();
+            out.push(LyricCandidate {
+                track: s("trackName"),
+                artist: s("artistName"),
+                album: s("albumName"),
+                duration: item["duration"].as_f64().unwrap_or(0.0),
+                lyrics,
+            });
+        }
+        if out.len() >= 30 {
+            break;
+        }
+    }
+    let cost = |c: &LyricCandidate| {
+        let off = if duration > 0.0 && c.duration > 0.0 { (c.duration - duration).abs().min(600.0) } else { 60.0 };
+        off + if c.lyrics.synced.is_some() { 0.0 } else { 30.0 }
+    };
+    out.sort_by(|a, b| cost(a).total_cmp(&cost(b)));
+    out.truncate(30);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

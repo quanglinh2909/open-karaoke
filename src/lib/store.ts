@@ -121,6 +121,10 @@ interface Store {
   tab: Tab;
   sidebar: boolean;
   settingsOpen: boolean;
+  /** The full-page lyrics editor: the current lyrics to edit, or empty to write new ones. */
+  lyricsEditor: null | "edit" | "new";
+  /** The page for choosing parts (harmony, original singer) by lyric line. */
+  partsEditor: boolean;
   lastRecording: string | null;
   /** Voice Lab transport, mirrored from ticks. */
   lab: { state: number; pos: number; len: number };
@@ -228,6 +232,8 @@ export const useStore = create<Store>((set, get) => ({
   tab: "tune",
   sidebar: true,
   settingsOpen: false,
+  lyricsEditor: null,
+  partsEditor: false,
   lastRecording: null,
   lab: { state: 0, pos: 0, len: 0 },
   myPresets: loadList<MyPreset>(MY_PRESETS_KEY),

@@ -1,6 +1,7 @@
 import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { deleteLine, fixWord, lyricsFitted, startLyrics } from "../lib/loader";
+import { deleteLine, fixWord, hasFixes, lyricIssues, lyricsBusy, lyricsFitted, refitWithFixes, songSingers, startLyrics } from "../lib/loader";
 import { lineAt, type Line } from "../lib/lrc";
+import { SINGER_LABEL } from "../lib/parts";
 import {
   ANCHOR,
   cueAt,
@@ -35,13 +36,14 @@ function AlignNote() {
       song.lyrics.status !== "loading";
     if (!ready || lyricsFitted(song.meta.id)) return null;
     return (
-      <button
-        className="align-note align-start"
-        onClick={() => startLyrics(song.meta.id)}
-        title="Nghe giọng ca sĩ và khớp lời từng chữ (vài phút, chạy nền)"
-      >
-        ▶ Khớp lời theo ca sĩ
-      </button>
+      <div className="align-note align-choice">
+        <button className="align-start" onClick={() => startLyrics(song.meta.id, "fast")} title="Canh lời theo giọng ca sĩ bằng MMS (khoảng 1 phút). Dòng nghi sai sẽ được đánh dấu ⚠ để bạn sửa.">
+          ▶ Khớp nhanh
+        </button>
+        <button className="align-start" onClick={() => startLyrics(song.meta.id, "whisper")} title="Whisper nghe cả bài rồi mới canh (khoảng 6–7 phút): sửa được chỗ ca sĩ hát khác lời, bỏ dòng, thêm dòng.">
+          ▶ Khớp kỹ (Whisper)
+        </button>
+      </div>
     );
   }
   if (aligning.stage === "queue")
@@ -59,6 +61,40 @@ function AlignNote() {
   );
 }
 
+/** On the stage: open the lyrics editor, and fit again after corrections. */
+function LyricsActions() {
+  const song = useStore((s) => s.song);
+  // Re-render when lines change (a word fixed, a line deleted).
+  useStore((s) => s.song?.lyrics);
+  const aligning = useStore((s) => !!s.song?.aligning);
+  const set = useStore((s) => s.set);
+  if (!song || song.lyrics.status === "loading") return null;
+  const has = !!(song.lyrics.lines || song.lyrics.plain);
+  const fixed = hasFixes() && !!song.sourceId && !!song.info && !song.info.separating;
+  return (
+    <div className="lyrics-actions">
+      {fixed && (
+        <button
+          className="hot"
+          disabled={aligning || lyricsBusy()}
+          onClick={() => refitWithFixes()}
+          title="Canh lại thời gian theo các chữ bạn đã sửa và các dòng đã xoá"
+        >
+          ↻ Canh lại theo chữ đã sửa
+        </button>
+      )}
+      {song.lyrics.lines && song.info && !song.info.vocalRemoved && (
+        <button onClick={() => set({ partsEditor: true })} title="Chọn đoạn ca sĩ gốc hát và đoạn có bè">
+          ✂ Phân đoạn
+        </button>
+      )}
+      <button onClick={() => set({ lyricsEditor: has ? "edit" : "new" })} title="Mở trang sửa toàn bộ lời">
+        ✎ {has ? "Sửa lời" : "Viết lời"}
+      </button>
+    </div>
+  );
+}
+
 export function Lyrics() {
   const song = useStore((s) => s.song);
   const lyrics = song?.lyrics;
@@ -69,6 +105,7 @@ export function Lyrics() {
   return (
     <div className="lyrics">
       <AlignNote />
+      <LyricsActions />
       <div className="intro-title">{song.meta.title}</div>
       <div className="intro-artist">{song.meta.artist}</div>
       {lyrics?.status === "loading" && (
@@ -91,6 +128,12 @@ export function Lyrics() {
 
 function SyncedLyrics({ lines }: { lines: Line[] }) {
   const meta = useStore((s) => s.song?.meta);
+  // Lines the last fit could hardly place: marked ⚠ for the user to check.
+  const issues = meta ? lyricIssues(meta.id) : [];
+  const doubtful = (l: Line) => issues.some((i) => i.text === l.text && Math.abs(i.start - l.start) < 1.5);
+  // Duets: who sings each line (marked on the parts page; re-read when it closes).
+  useStore((s) => s.partsEditor);
+  const singers = songSingers();
   const [focus, setFocus] = useState(-1);
   /** The word being corrected (double-click), if any. */
   const [editing, setEditing] = useState<{ li: number; k: number } | null>(
@@ -225,6 +268,7 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
   return (
     <div className="lyrics synced" ref={boxEl}>
       <AlignNote />
+      <LyricsActions />
       <div className="lyric-track" ref={trackEl}>
         <div
           className={`lyric-line tl intro ${place(-1)}`}
@@ -256,7 +300,7 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
         {lines.map((line, li) => (
           <div
             key={li}
-            className={`lyric-line tl ${place(li)}`}
+            className={`lyric-line tl ${place(li)} ${doubtful(line) ? "doubt" : ""} ${singers[li] ? `sing-${singers[li]}` : ""}`}
             ref={(el) => {
               itemEls.current[li + 1] = el;
             }}
@@ -268,6 +312,12 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
             >
               ✕
             </button>
+            {singers[li] && <span className="singer-tag">{SINGER_LABEL[singers[li]!]}</span>}
+            {doubtful(line) && (
+              <span className="doubt-mark" title="Dòng này canh có thể sai: kiểm tra ở tab Bài hát → Dòng cần kiểm tra">
+                ⚠
+              </span>
+            )}
             {line.words.map((w, k) => {
               const last = k === line.words.length - 1;
               const held = isHeld(w, last);

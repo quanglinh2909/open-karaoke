@@ -80,6 +80,9 @@ const clean = (s: string) =>
     .replace(/^[\s|｜\-–—:]+|[\s|｜\-–—:]+$/g, "")
     .trim();
 
+/** Words that describe performers rather than a song title. */
+const PERFORMERS = /(?<![\p{L}\p{N}])(cover|ft\.?|feat\.?|x|đổi hit|song ca|với|live)(?![\p{L}\p{N}])|&/iu;
+
 const cleanChannel = (c: string) =>
   c
     .replace(/\s*-\s*Topic$/i, "")
@@ -102,21 +105,28 @@ function namesChannel(part: string, channel: string): boolean {
  */
 export function songFromVideo(v: Video): SongMeta {
   const channel = cleanChannel(v.channel);
-  let title = v.title;
+  // "… | FOREST STUDIO": a trailing part that only names the channel says nothing.
+  const kept = v.title.split(/\s*[|｜]\s*/);
+  while (kept.length > 1 && namesChannel(kept[kept.length - 1], channel)) kept.pop();
+  const full = kept.join(" | ");
+  let title = full;
   let artist = channel;
-  const dash = v.title.split(/\s+[-–—]\s+/);
-  const bar = v.title.split(/\s*[|｜]\s*/).filter((p) => clean(p));
+  const dash = full.split(/\s+[-–—]\s+/);
+  const bar = full.split(/\s*[|｜]\s*/).filter((p) => clean(p));
   const parts = dash.length >= 2 ? [dash[0], dash.slice(1).join(" - ")] : bar.length >= 2 ? bar.slice(0, 2) : null;
   if (parts) {
     // Usual order: "Artist - Title", but "Title | Artist".
     let [who, what] = dash.length >= 2 ? parts : [parts[1], parts[0]];
     if (namesChannel(what, channel) && !namesChannel(who, channel)) [who, what] = [what, who];
+    // "Title - A đổi hit với B", "Title - A x B", "Title - A cover": the
+    // part describing who sings is the artist.
+    else if (PERFORMERS.test(what) && !PERFORMERS.test(who) && !namesChannel(who, channel)) [who, what] = [what, who];
     artist = clean(who) || channel;
     title = what;
   }
   return {
     id: v.id,
-    title: clean(title) || v.title,
+    title: clean(title) || full,
     artist,
     album: "",
     duration: v.duration ?? 0,

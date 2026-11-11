@@ -1,7 +1,7 @@
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { errorText } from "./api";
 import { useStore } from "./store";
-import { exportKaraokeVideo, type LyricStyle, type Orientation } from "./videoExport";
+import { exportKaraokeVideo, type Backdrop, type LyricStyle, type Orientation } from "./videoExport";
 
 /** Set to stop the running export at its next frame. */
 let stopRequested = false;
@@ -11,7 +11,7 @@ let stopRequested = false;
  * any panel: switching tabs, going home or opening another song doesn't
  * stop it, and the corner indicator shows its progress throughout.
  */
-export async function startExport(orientation: Orientation, style: LyricStyle) {
+export async function startExport(orientation: Orientation, style: LyricStyle, backdrop: Backdrop) {
   const s = useStore.getState();
   if (s.exportJob || !s.song) return;
   stopRequested = false;
@@ -22,6 +22,7 @@ export async function startExport(orientation: Orientation, style: LyricStyle) {
     const path = await exportKaraokeVideo(
       orientation,
       style,
+      backdrop,
       (p) => {
         // A store update per percent is plenty.
         if (p - shown >= 0.01 || p >= 0.99) {

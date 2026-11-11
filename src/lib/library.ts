@@ -16,6 +16,38 @@ export interface SongSettings {
   key?: { tonic: number; scale: number };
   /** Seconds skipped at the start and end of the recording. */
   trim?: { start: number; end: number };
+  /** This song's mix: backing track, guide vocal, harmony and original-singer levels. */
+  mix?: Record<string, number>;
+  /** This song's automatic harmony (scale steps, empty = off) and its style. */
+  backing?: { degrees: number[]; style: "choir" | "voice" };
+}
+
+/** A fitted line the aligner could hardly find in the vocal: worth checking by hand. */
+export interface LyricIssue {
+  text: string;
+  /** Where it was placed (seconds, lyric time). */
+  start: number;
+  /** Mean letter score of the line (0 = clearly heard; below about -3 doubtful). */
+  score: number;
+}
+
+/** Parts of a recording (seconds), chosen by lyric line. */
+export interface SongParts {
+  backing: [number, number][];
+  original: [number, number][];
+  /** Hand adjustments of the parts' edges (seconds added to start and end), by the lines they cover. */
+  adjust?: { original?: Record<string, [number, number]>; backing?: Record<string, [number, number]> };
+  /** Where an original-singer part reaches into the user's line: which voice to keep there (start, end), by lines covered. */
+  laps?: Record<string, ["auto" | "female" | "male" | "none", "auto" | "female" | "male" | "none"]>;
+  /** Duets: which lines the female or male singer (or both) sings, as line spans in the recording. Shown on the lyrics. */
+  singers?: Partial<Record<"female" | "male" | "both", [number, number][]>>;
+}
+
+/** Lyrics the user picked from a search or pasted, and what they searched for. */
+export interface LyricsPick {
+  label: string;
+  title: string;
+  artist: string;
 }
 
 export interface LibraryEntry {
@@ -24,8 +56,14 @@ export interface LibraryEntry {
   /** Alternative recordings, for the Song tab. */
   originals: Ranked[];
   lyrics: Lyrics | null;
+  /** Where `lyrics` came from, when the user chose them (shown in the Song tab). */
+  lyricsPick?: LyricsPick;
+  /** Parts of the recording (seconds): with the automatic harmony, and sung by the original singer. */
+  parts?: SongParts;
+  /** The title and artist the user last searched lyrics under. */
+  lyricsQuery?: { title: string; artist: string };
   /** Lyrics re-timed to the recording `sourceId` by forced alignment. */
-  aligned?: { sourceId: string; lines: Line[]; v?: number };
+  aligned?: { sourceId: string; lines: Line[]; v?: number; issues?: LyricIssue[] };
   settings?: SongSettings;
   /** Words the user corrected: "<original line text>|<word index>" → text.
    * Keyed by the line's text, so a fix applies to every repeat of a chorus

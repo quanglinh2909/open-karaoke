@@ -44,7 +44,14 @@ fn main() {
     if tsv.ends_with(".json") {
         let lines: Vec<Vec<String>> = serde_json::from_str(&std::fs::read_to_string(tsv).expect("lyrics")).expect("json");
         let em = emissions(model, wav);
-        let times = align_lines_with(&em, &lines, STAR_PENALTY).expect("align");
+        // Optional windows.json: where Whisper heard each line (as the app passes them).
+        let times = match args.get(3).filter(|a| a.ends_with(".json")) {
+            Some(w) => {
+                let windows: Vec<Option<(f64, f64)>> = serde_json::from_str(&std::fs::read_to_string(w).expect("windows")).expect("json");
+                open_karaoke_lib::audio::align::align_lines_within(&em, &lines, &windows, STAR_PENALTY).expect("align")
+            }
+            None => align_lines_with(&em, &lines, STAR_PENALTY).expect("align"),
+        };
         println!("{}", serde_json::to_string(&times).unwrap());
         return;
     }
@@ -65,7 +72,13 @@ fn main() {
 
     for penalty in penalties {
         println!("\n=== star penalty {penalty}");
-        let times = align_lines_with(&em, &lines, penalty).expect("align");
+        // GUIDED=1: as the app does with published line times.
+        let times = if std::env::var_os("GUIDED").is_some() {
+            let lrc: Vec<Option<f64>> = rows.iter().map(|r| Some(r.0)).collect();
+            open_karaoke_lib::audio::align::align_lines_guided(&em, &lines, &lrc, penalty).expect("align")
+        } else {
+            align_lines_with(&em, &lines, penalty).expect("align")
+        };
         let mut scores = Vec::new();
         for ((lrc, ws, original), line) in rows.iter().zip(&times) {
             let placed: Vec<_> = line.iter().flatten().collect();

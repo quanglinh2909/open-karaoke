@@ -38,6 +38,8 @@ export const DEFAULT_PARAMS: Params = {
   master: 0.9,
   instrumental: 0.85,
   guide: 0,
+  backing: 0.35,
+  lead: 0.85,
   vocal: 0.9,
   monitor: 1,
   mic: 1,

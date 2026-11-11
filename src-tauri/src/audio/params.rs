@@ -87,6 +87,8 @@ params! {
     master = 0.9,
     instrumental = 0.85,
     guide = 0.0,
+    backing = 0.35,      // the automatic harmony made from the original vocal
+    lead = 0.85,         // the original singer in the parts chosen for them
     vocal = 0.9,
     monitor = 1.0,
     mic = 1.0, // 0 = mic switched off (nothing heard, scored or recorded)

@@ -16,6 +16,77 @@ export function romanize(word: string): string {
     .replace(/[^a-z']/g, "");
 }
 
+const VI_DIGITS = ["không", "một", "hai", "ba", "bốn", "năm", "sáu", "bảy", "tám", "chín"];
+
+/** 0–999 read in Vietnamese; `full` reads a leading zero hundred ("không trăm"). */
+function viHundreds(n: number, full: boolean): string[] {
+  const [h, t, u] = [Math.floor(n / 100), Math.floor(n / 10) % 10, n % 10];
+  const out: string[] = [];
+  if (h || full) out.push(VI_DIGITS[h], "trăm");
+  if (t === 0) {
+    if (u && (h || full)) out.push("lẻ");
+    if (u || (!h && !full)) out.push(VI_DIGITS[u]);
+  } else {
+    out.push(...(t === 1 ? ["mười"] : [VI_DIGITS[t], "mươi"]));
+    if (u === 1 && t > 1) out.push("mốt");
+    else if (u === 4 && t > 1) out.push("tư");
+    else if (u === 5) out.push("lăm");
+    else if (u) out.push(VI_DIGITS[u]);
+  }
+  return out;
+}
+
+/** A whole number read out in Vietnamese ("8515" → "tám nghìn năm trăm mười lăm"). */
+export function viNumber(n: number): string {
+  if (n === 0) return "không";
+  const units = ["", "nghìn", "triệu", "tỷ"];
+  const groups: number[] = [];
+  for (let x = n; x > 0; x = Math.floor(x / 1000)) groups.push(x % 1000);
+  const out: string[] = [];
+  for (let g = groups.length - 1; g >= 0; g--) {
+    if (!groups[g]) continue;
+    out.push(...viHundreds(groups[g], g < groups.length - 1), units[g] ?? "");
+  }
+  return out.filter(Boolean).join(" ");
+}
+
+const EN_ONES = ["zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen", "nineteen"];
+const EN_TENS = ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+
+/** A whole number read out in English ("8515" → "eight thousand five hundred fifteen"). */
+export function enNumber(n: number): string {
+  const below1000 = (x: number): string[] => {
+    const out: string[] = [];
+    if (x >= 100) out.push(EN_ONES[Math.floor(x / 100)], "hundred");
+    const r = x % 100;
+    if (r >= 20) out.push(EN_TENS[Math.floor(r / 10)], ...(r % 10 ? [EN_ONES[r % 10]] : []));
+    else if (r || !out.length) out.push(EN_ONES[r]);
+    return out;
+  };
+  if (n === 0) return "zero";
+  const units = ["", "thousand", "million", "billion"];
+  const out: string[] = [];
+  const groups: number[] = [];
+  for (let x = n; x > 0; x = Math.floor(x / 1000)) groups.push(x % 1000);
+  for (let g = groups.length - 1; g >= 0; g--)
+    if (groups[g]) out.push(...below1000(groups[g]), units[g] ?? "");
+  return out.filter(Boolean).join(" ");
+}
+
+/**
+ * What the aligner listens for in a lyric word: its letters, romanized. A
+ * number has none, so it is read out ("8515" sung as "tám nghìn năm trăm
+ * mười lăm"); without this it was squeezed into 0.3 s and the word before
+ * it held through the time it was sung.
+ */
+export function spokenForm(word: string, vietnamese: boolean): string {
+  const digits = word.replace(/[.,]/g, "").match(/^\D*?(\d{1,12})\D*$/);
+  if (!digits) return romanize(word);
+  const n = Number(digits[1]);
+  const read = vietnamese ? viNumber(n) : enNumber(n);
+  return romanize(word.replace(/[\d.,]+/, " " + read + " ").replace(/\s+/g, ""));
+}
+
 /** Plain (unsynced) lyrics as untimed lines, ready to be aligned. */
 export function linesFromPlain(plain: string): Line[] {
   return plain
@@ -41,6 +112,54 @@ const WORD_MIN = -4.5;
 const PACE = 0.3;
 
 /**
+ * A whole line nobody could hear (a producer tag like "(Hey, Kewtiie)", a
+ * hum): with LRC times it goes where the LRC puts it, shifted by the offset
+ * of the nearest heard line, instead of being squeezed against the next
+ * heard word. Its words get times in `times` (at a natural pace) only if
+ * that fits between the heard words around it.
+ */
+function placeUnheardLines(
+  lines: Line[],
+  origin: number[],
+  lineOf: number[],
+  times: (WordTime | null)[],
+  lrcStarts: (number | null)[],
+) {
+  const firstWord: number[] = [];
+  lineOf.forEach((li, i) => {
+    if (firstWord[li] === undefined) firstWord[li] = i;
+  });
+  const range = (li: number) => [firstWord[li], firstWord[li] + lines[li].words.length] as const;
+  const heard = (li: number) => {
+    const [a, b] = range(li);
+    return times.slice(a, b).some(Boolean);
+  };
+  // Offset of a line whose first word was heard: aligned time − LRC time.
+  const offset = (li: number) => {
+    const t = times[firstWord[li]];
+    const lrc = lrcStarts[origin[li]];
+    return t && lrc != null && lrc > 0 ? t.start - lrc : null;
+  };
+  for (let li = 0; li < lines.length; li++) {
+    const lrc = lrcStarts[origin[li]];
+    if (heard(li) || lrc == null || lrc <= 0) continue;
+    let off: number | null = null;
+    for (let d = 1; d < lines.length && off === null; d++)
+      off = (li + d < lines.length ? offset(li + d) : null) ?? (li - d >= 0 ? offset(li - d) : null);
+    if (off === null) continue;
+    const [a, b] = range(li);
+    const n = b - a;
+    const prevEnd = [...times.slice(0, a)].reverse().find(Boolean)?.end ?? 0;
+    const nextStart = times.slice(b).find(Boolean)?.start ?? Infinity;
+    const start = Math.max(lrc + off, prevEnd);
+    const step = Math.min(PACE, (nextStart - start) / n);
+    if (step < 0.08) continue; // no room: leave it to the usual placement
+    for (let k = 0; k < n; k++)
+      times[a + k] = { start: start + k * step, end: start + (k + 1) * step, score: WORD_MIN };
+  }
+}
+
+/**
  * Rebuild `lines` with the word times from forced alignment. Words that
  * weren't heard (or have no letters, like numbers) are placed next to the
  * nearest heard word of their line at a natural pace. Null when too little
@@ -49,6 +168,8 @@ const PACE = 0.3;
 export function retime(
   all: Line[],
   heardTimes: (WordTime | null)[],
+  /** Each line's published (LRC) time, if the lines are the published ones. */
+  lrcStarts: (number | null)[] | null = null,
 ): Line[] | null {
   if (heardTimes.length !== all.reduce((n, l) => n + l.words.length, 0))
     return null;
@@ -56,8 +177,10 @@ export function retime(
   // marked: a wrong word is easier to correct than a missing one.
   let w0 = 0;
   const aligned: (WordTime | null)[] = [];
+  /** Index in `all` of each kept line. */
+  const origin: number[] = [];
   const lines = all
-    .map((l) => {
+    .map((l, li) => {
       const words = l.words.map((w, k) => {
         const t = heardTimes[w0 + k];
         aligned.push(t);
@@ -79,6 +202,7 @@ export function retime(
         aligned.splice(aligned.length - words.length, words.length);
         return { ...l, words: [] };
       }
+      origin.push(li);
       return { ...l, words, text: words.map((w) => w.text).join(" ") };
     })
     .filter((l) => l.words.length);
@@ -91,6 +215,7 @@ export function retime(
     .filter(({ w }) => (w as MergedWord).heard !== false);
   if (agreed.filter(({ t }) => t).length < agreed.length * 0.8) return null;
   const lineOf = lines.flatMap((l, i) => l.words.map(() => i));
+  if (lrcStarts) placeUnheardLines(lines, origin, lineOf, times, lrcStarts);
 
   const timed: { start: number; end: number }[] = [];
   for (let i = 0; i < words.length;) {

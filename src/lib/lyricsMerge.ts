@@ -337,9 +337,22 @@ export function dropEchoes(heard: HeardLine[]): HeardLine[] {
  * (choruses repeat, so any line may match anywhere), spelt as the LRC
  * spells them except where the singer clearly sings another word.
  */
+/** How well the published lyrics matched what Whisper heard. */
+export interface MergeReport {
+  /** Share of the distinct published lines Whisper was heard singing (0–1). */
+  agreement: number;
+  /** The published lyrics looked like another song, so Whisper's words were used. */
+  replaced: boolean;
+}
+
+/** Whisper is clear enough to stand in for lyrics that look wrong. */
+const CLEAR_WORDS = 30;
+const CLEAR_P = 0.6;
+
 export function mergeLyrics(
   lrc: Line[] | null,
   heard: HeardLine[],
+  report?: MergeReport,
 ): MergedLine[] {
   const B: Hw[] = heard.flatMap((l, seg) =>
     l.words.map((w) => ({
@@ -425,7 +438,18 @@ export function mergeLyrics(
   parts.reverse();
   const matched = parts.filter((p) => p.line >= 0);
   const covered = new Set(matched.map((p) => p.line)).size;
-  if (covered < refs.length * MIN_AGREEMENT) return lrc;
+  if (report) report.agreement = covered / refs.length;
+  if (covered < refs.length * MIN_AGREEMENT) {
+    // Hardly any published line was sung. If Whisper heard the singer
+    // clearly, the lyrics are most likely another song's: forcing them onto
+    // this vocal would be wrong everywhere, so what was heard is used.
+    const meanP = B.reduce((a, w) => a + w.p, 0) / B.length;
+    if (B.length >= CLEAR_WORDS && meanP >= CLEAR_P) {
+      if (report) report.replaced = true;
+      return mergeLyrics(null, heard);
+    }
+    return lrc;
+  }
 
   const out: Out[] = [];
   parts.forEach((part, i) => {

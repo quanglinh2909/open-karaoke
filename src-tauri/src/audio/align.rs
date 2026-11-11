@@ -233,6 +233,71 @@ pub fn align_lines_within(
         .collect())
 }
 
+/// How far (seconds) a line may sit from where its neighbours' offset to
+/// the published timing puts it before it counts as misplaced.
+const GUIDE_TOLERANCE: f64 = 2.0;
+
+/// Published lyrics with line times (LRC) are often timed to another edit
+/// (a longer intro, a shorter interlude), but within a passage the gaps
+/// between lines hold. After a first, unconstrained alignment, a line that
+/// sits far from where the lines before it, or the lines after it, say it
+/// should (a line pulled into an interlude) gets a window there, between its
+/// neighbours; the lines that agree keep where they are. None when every
+/// line agrees, so nothing needs aligning again.
+pub fn guide_windows(first: &[Vec<Option<WordTime>>], lrc: &[Option<f64>]) -> Option<Vec<Option<(f64, f64)>>> {
+    let n = first.len();
+    let placed: Vec<Option<(f64, f64)>> = first
+        .iter()
+        .map(|line| {
+            let mut ws = line.iter().flatten();
+            let a = ws.next()?;
+            Some((a.start, ws.last().unwrap_or(a).end))
+        })
+        .collect();
+    let lrc_at = |i: usize| lrc.get(i).copied().flatten();
+    let offset: Vec<Option<f64>> = (0..n).map(|i| Some(placed[i]?.0 - lrc_at(i)?)).collect();
+    let median = |mut v: Vec<f64>| -> Option<f64> {
+        v.sort_by(f64::total_cmp);
+        v.get(v.len() / 2).copied()
+    };
+    let mut windows = vec![None; n];
+    let mut moved = false;
+    for i in 0..n {
+        let Some(at) = lrc_at(i) else { continue };
+        let before = median((0..i).rev().filter_map(|j| offset[j]).take(3).collect());
+        let after = median((i + 1..n).filter_map(|j| offset[j]).take(3).collect());
+        let guesses: Vec<f64> = [after, before].into_iter().flatten().collect();
+        // In place if it agrees with the line just before or after it, or
+        // with either side's median (one misplaced line can't sway it).
+        let prev = (0..i).rev().find_map(|j| offset[j]);
+        let next = (i + 1..n).find_map(|j| offset[j]);
+        if let Some(own) = offset[i] {
+            let agrees = guesses.iter().chain(prev.iter()).chain(next.iter()).any(|o| (own - o).abs() <= GUIDE_TOLERANCE);
+            if guesses.is_empty() || agrees {
+                windows[i] = placed[i];
+                continue;
+            }
+        }
+        // Misplaced (or not placed): where a side says, between the neighbours.
+        let lo = (0..i).rev().find_map(|j| placed[j]).map_or(0.0, |p| p.1);
+        let hi = (i + 1..n).find_map(|j| placed[j]).map_or(f64::INFINITY, |p| p.0);
+        let Some(start) = guesses.iter().map(|o| at + o).find(|s| *s >= lo - 0.5 && *s < hi) else { continue };
+        let len = (i + 1..n).find_map(lrc_at).map_or(6.0, |next| next - at).clamp(1.0, 12.0);
+        windows[i] = Some((start, (start + len).min(hi)));
+        moved = true;
+    }
+    moved.then_some(windows)
+}
+
+/// Align, then align again where [`guide_windows`] finds lines out of place.
+pub fn align_lines_guided(em: &Emissions, lines: &[Vec<String>], lrc: &[Option<f64>], star_penalty: f32) -> Result<Vec<Vec<Option<WordTime>>>, String> {
+    let first = align_lines_within(em, lines, &[], star_penalty)?;
+    match guide_windows(&first, lrc) {
+        Some(windows) => align_lines_within(em, lines, &windows, star_penalty),
+        None => Ok(first),
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Span {
     first: usize,
@@ -337,10 +402,7 @@ pub struct Aligner {
 impl Aligner {
     pub fn load(model: &Path) -> Result<Self, String> {
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-        let env = ort::init()
-            .with_name("open-karaoke-align")
-            .build()
-            .map_err(|e| format!("Không khởi động được ONNX Runtime: {e}"))?;
+        let env = super::ort_env()?;
         let fail = |e: &dyn std::fmt::Display| format!("Không tải được mô hình canh lời: {e}");
         let session = Session::builder(&env)
             .map_err(|e| fail(&e))?
@@ -437,6 +499,33 @@ impl Aligner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_at(start: f64, end: f64) -> Vec<Option<WordTime>> {
+        vec![Some(WordTime { start, end, score: -0.5 })]
+    }
+
+    #[test]
+    fn guide_moves_a_line_pulled_into_an_interlude() {
+        // LRC timed to an edit with a 9 s shorter interlude before line 3:
+        // offsets +25 before it, +16 from it on. The aligner put line 3 nine
+        // seconds early (into the interlude).
+        let lrc = [Some(10.0), Some(16.0), Some(40.0), Some(46.0), Some(52.0)];
+        let first = vec![line_at(35.0, 40.0), line_at(41.0, 46.0), line_at(47.0, 50.0), line_at(62.0, 67.0), line_at(68.0, 73.0)];
+        let w = guide_windows(&first, &lrc).expect("line 3 is out of place");
+        let (a, _) = w[2].unwrap();
+        assert!((a - 56.0).abs() < 0.01, "expected at 40 + 16 = 56, got {a}");
+        assert_eq!(w[0], Some((35.0, 40.0)));
+        assert_eq!(w[3], Some((62.0, 67.0)));
+    }
+
+    #[test]
+    fn guide_leaves_agreeing_lines_alone() {
+        let lrc = [Some(10.0), Some(16.0), Some(22.0)];
+        let first = vec![line_at(35.0, 40.0), line_at(41.2, 46.0), line_at(46.8, 50.0)];
+        assert!(guide_windows(&first, &lrc).is_none());
+        // Plain lyrics (no times): nothing to go by.
+        assert!(guide_windows(&first, &[None, None, None]).is_none());
+    }
 
     /// Synthetic emissions where each frame strongly predicts one label.
     fn emissions(labels: &[usize]) -> Emissions {

@@ -53,6 +53,11 @@ pub struct Track {
     pub guide: Option<Buf>,
     /// `track_frame = guide_frame + guide_offset`.
     pub guide_offset: i64,
+    /// Automatic harmony made from the guide (same timeline as the guide).
+    pub backing: Option<Buf>,
+    /// The original singer, only in the parts chosen for them (a duet's
+    /// other voice), same timeline as the guide.
+    pub lead: Option<Buf>,
 }
 
 impl Track {
@@ -966,6 +971,8 @@ impl OutputState {
         let lab_playing = self.shared.lab_state.load(Relaxed) == LAB_PLAYING;
         let (master, inst, guide, vocal, monitor) =
             (p.master.get(), p.instrumental.get(), p.guide.get(), p.vocal.get(), p.monitor.get() > 0.5 || lab_playing);
+        let backing = p.backing.get().clamp(0.0, 1.5);
+        let lead = p.lead.get().clamp(0.0, 1.5);
         let drone_level = p.drone.get().clamp(0.0, 1.0);
         let drone_on = drone_level > 0.0 || self.drone.gain > 1e-4;
         if drone_on {
@@ -1064,9 +1071,15 @@ impl OutputState {
         self.rec_tmp.clear();
         let len = self.track.as_ref().map(|t| t.frames()).unwrap_or(0);
         // Snapshot what is playable for this whole block (one atomic read).
-        let (audio, guide_buf, guide_offset): (&[f32], &[f32], i64) = match &self.track {
-            Some(t) => (t.audio.ready(), t.guide.as_ref().map(|g| g.ready()).unwrap_or(&[]), t.guide_offset),
-            None => (&[], &[], 0),
+        let (audio, guide_buf, backing_buf, lead_buf, guide_offset): (&[f32], &[f32], &[f32], &[f32], i64) = match &self.track {
+            Some(t) => (
+                t.audio.ready(),
+                t.guide.as_ref().map(|g| g.ready()).unwrap_or(&[]),
+                t.backing.as_ref().map(|g| g.ready()).unwrap_or(&[]),
+                t.lead.as_ref().map(|g| g.ready()).unwrap_or(&[]),
+                t.guide_offset,
+            ),
+            None => (&[], &[], &[], &[], 0),
         };
         let ready = (audio.len() / 2) as u64;
         let mut buffering = false;
@@ -1088,10 +1101,33 @@ impl OutputState {
                         bl += gl * guide;
                         br += gr * guide;
                     }
+                    if !backing_buf.is_empty() {
+                        let (hl, hr) = Self::frame_at(backing_buf, f - guide_offset);
+                        bl += hl * backing;
+                        br += hr * backing;
+                    }
+                    if !lead_buf.is_empty() {
+                        let (ll, lr) = Self::frame_at(lead_buf, f - guide_offset);
+                        bl += ll * lead;
+                        br += lr * lead;
+                    }
                     if recording {
+                        // The recording keeps what belongs to the song: the
+                        // harmony and the original singer's parts.
                         let (il, ir) = Self::frame_at(audio, f - comp);
                         rl = il * inst;
                         rr = ir * inst;
+                        let at = f - comp - guide_offset;
+                        if !backing_buf.is_empty() {
+                            let (hl, hr) = Self::frame_at(backing_buf, at);
+                            rl += hl * backing;
+                            rr += hr * backing;
+                        }
+                        if !lead_buf.is_empty() {
+                            let (ll, lr) = Self::frame_at(lead_buf, at);
+                            rl += ll * lead;
+                            rr += lr * lead;
+                        }
                     }
                     self.pos += 1;
                 }
