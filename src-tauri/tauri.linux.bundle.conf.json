@@ -1,0 +1,21 @@
+{
+  "bundle": {
+    "targets": [
+      "deb"
+    ],
+    "resources": {
+      "bundled/bin/": "bundled/bin/"
+    },
+    "linux": {
+      "deb": {
+        "files": {
+          "/usr/lib/open-karaoke/libonnxruntime.so.1": "bundled/ort/libonnxruntime.so.1",
+          "/usr/lib/open-karaoke/libonnxruntime_providers_shared.so": "bundled/ort/libonnxruntime_providers_shared.so"
+        },
+        "recommends": [
+          "ffmpeg"
+        ]
+      }
+    }
+  }
+}

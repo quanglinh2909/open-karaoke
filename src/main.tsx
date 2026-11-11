@@ -3,7 +3,7 @@ import ReactDOM from "react-dom/client";
 import "@fontsource-variable/inter";
 import "@fontsource-variable/bricolage-grotesque";
 import "./styles.css";
-import App from "./App";
+import { loadSharedStore } from "./lib/sharedStore";
 
 // Linux (WebKitGTK, with its DMA-BUF renderer off to avoid compositor
 // crashes) paints blurs over moving content on the CPU every frame: "lite"
@@ -53,10 +53,17 @@ window.addEventListener("unhandledrejection", (e) => {
   if (r instanceof Error) banner(`${r.message}\n${r.stack ?? ""}`);
 });
 
-ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
-  <React.StrictMode>
-    <Boundary>
-      <App />
-    </Boundary>
-  </React.StrictMode>,
-);
+// The saved state (shared with the other build) goes into localStorage
+// before the app's modules read it: App is imported only then.
+void loadSharedStore()
+  .catch(() => undefined)
+  .then(() => import("./App"))
+  .then(({ default: App }) =>
+    ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
+      <React.StrictMode>
+        <Boundary>
+          <App />
+        </Boundary>
+      </React.StrictMode>,
+    ),
+  );

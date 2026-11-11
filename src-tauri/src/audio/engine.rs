@@ -567,6 +567,8 @@ impl Engine {
         };
         let out_default = out_dev.default_output_config().map_err(|e| format!("Thiết bị phát: {e}"))?;
 
+        // Only the Windows exclusive mode below sets it.
+        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut note = None;
         #[cfg(windows)]
         if choice.exclusive && choice.asio.is_none() {

@@ -20,6 +20,10 @@ struct Dirs {
     /// Separated instrumental/vocal stems, so repeat songs start instantly.
     stems: PathBuf,
     recordings: PathBuf,
+    /// The UI's saved state (library, settings), one file per key: shared by
+    /// the dev build and the installed app, whose webviews keep separate
+    /// localStorage (another origin each).
+    store: PathBuf,
 }
 
 #[derive(Default)]
@@ -1677,6 +1681,49 @@ fn video_ffmpeg_backdrop(state: State<'_, AppState>, request: tauri::ipc::Reques
     std::fs::write(part.with_extension("part.bg.png"), bytes).map_err(|e| e.to_string())
 }
 
+// ------------------------------------------------------------------ store --
+
+/// A store key as a file name: the UI's own keys only (`openkaraoke.*`).
+fn store_file(state: &AppState, key: &str) -> Res<PathBuf> {
+    if !key.starts_with("openkaraoke.") || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-') {
+        return Err("Khóa lưu trữ không hợp lệ".into());
+    }
+    Ok(state.dirs.store.join(format!("{key}.json")))
+}
+
+/// Every saved key and its value (the UI loads these before it starts).
+#[tauri::command]
+fn store_load(state: State<'_, AppState>) -> std::collections::HashMap<String, String> {
+    let mut out = std::collections::HashMap::new();
+    if let Ok(entries) = std::fs::read_dir(&state.dirs.store) {
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if let Some(key) = name.strip_suffix(".json").filter(|k| k.starts_with("openkaraoke.")) {
+                if let Ok(v) = std::fs::read_to_string(e.path()) {
+                    out.insert(key.to_string(), v);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Save one key (written whole, then renamed: never half a file), or remove it.
+#[tauri::command]
+fn store_set(state: State<'_, AppState>, key: String, value: Option<String>) -> Res<()> {
+    let path = store_file(&state, &key)?;
+    match value {
+        Some(v) => {
+            let tmp = path.with_extension("json.tmp");
+            std::fs::write(&tmp, v).and_then(|_| std::fs::rename(&tmp, &path)).map_err(|e| format!("Không lưu được dữ liệu: {e}"))
+        }
+        None => match std::fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+            _ => Ok(()),
+        },
+    }
+}
+
 /// A line from the UI in the app's log (e.g. how long an export took).
 #[tauri::command]
 fn dev_log(text: String) {
@@ -2223,7 +2270,8 @@ pub fn run() {
                 .audio_dir()
                 .map(|d| d.join("Open Karaoke"))
                 .unwrap_or_else(|_| data.join("recordings"));
-            let dirs = Dirs { tools: data.join("bin"), cache: cache.clone(), stems: stems.clone(), recordings };
+            let dirs = Dirs { tools: data.join("bin"), cache: cache.clone(), stems: stems.clone(), recordings, store: data.join("store") };
+            std::fs::create_dir_all(&dirs.store)?;
             std::fs::create_dir_all(&dirs.tools)?;
             std::fs::create_dir_all(&dirs.cache)?;
             std::fs::create_dir_all(&dirs.stems)?;
@@ -2308,6 +2356,8 @@ pub fn run() {
             video_ffmpeg_available,
             video_ffmpeg_backdrop,
             dev_log,
+            store_load,
+            store_set,
             video_ffmpeg_loop,
             video_ffmpeg_begin,
             video_ffmpeg_frame,

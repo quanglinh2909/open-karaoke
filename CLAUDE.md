@@ -10,7 +10,7 @@ Open Karaoke is a Tauri 2 desktop app with a Rust core (`src-tauri/`) for real-t
 npm install
 npm run app            # tauri dev: Vite on :1420 + cargo run, hot reload for both
 npm run dist           # installers → src-tauri/target/release/bundle/
-# run-app.cmd / build-installer.cmd: the same with this machine's build env set (Windows). run-app.sh: the same on Ubuntu 22.04 (the env vars below).
+# run-app.cmd / build-installer.cmd: the same with this machine's build env set (Windows). run-app.sh / build-installer.sh: the same on Ubuntu 22.04 (`scripts/linux-build-env.sh` sets the env vars below; the .deb ships the models and ONNX Runtime in /usr/lib/open-karaoke, found through an rpath).
 # build-installer.cmd makes the full installer: it stages %APPDATA%pp.openkaraoke.desktopin
 # (yt-dlp, Deno, all models, ~1.1 GB) into src-tauri/bundled/ and builds with
 # tauri.bundle.conf.json (NSIS, uncompressed); on first launch tools::adopt_bundled
@@ -57,6 +57,7 @@ Stop `npm run app` before running `cargo` commands by hand. Two concurrent build
 
 ### UI (`src`)
 
+- **Saved state is shared between builds**: every `openkaraoke.*` localStorage key is also a file in `<app data>/store/` (`store_load`/`store_set` in lib.rs, `lib/sharedStore.ts`). `main.tsx` loads the files into localStorage before it imports `App` (modules read localStorage at import), then each change is written back, debounced. The dev build (`http://localhost:1420`) and the installed app (`tauri://localhost`) have separate localStorage, so without this they kept separate libraries.
 - **`lib/store.ts`** is a single Zustand store: `song: SongState`, params, history, toasts. **`lib/api.ts`** has typed `invoke` wrappers and event listeners for every command and event.
 - **`lib/loader.ts`** orchestrates a song: `openSong` → rank YouTube candidates (`sources.ts`) → download → `songSeparate` → lyrics. A module-level `loadToken` is also the separation job id. Every async step checks `isCurrent(token)` so a stale song never writes state. Per-song results (chosen source, lyrics, aligned lyrics) persist in localStorage via `library.ts`.
 
