@@ -22,6 +22,17 @@ export interface SongMeta {
 }
 
 /** A note of the original singer's melody: seconds in the recording, fractional MIDI. */
+/** The song's beat: tempo and beat times (seconds in the recording). */
+export interface Beats {
+  bpm: number;
+  times: number[];
+  /** The music's loudness every `ENERGY_STEP` seconds. */
+  energy: number[];
+}
+
+/** Seconds per `Beats.energy` value (as in audio/beats.rs). */
+export const ENERGY_STEP = 0.5;
+
 export interface MelodyNote {
   start: number;
   end: number;
@@ -35,7 +46,8 @@ export interface Lyrics {
 }
 
 /** The automatic harmony: a synthesised "ooh" choir, or the singer's own voice shifted. */
-export type BackingStyle = "choir" | "voice";
+/** "choir": a synthesised "ooh"; "voice": the singer's own, shifted; "original": the record's own backing vocals, split from the singer's. */
+export type BackingStyle = "choir" | "voice" | "original";
 
 /** One published lyrics entry (LRCLIB), for picking by hand. */
 export interface LyricCandidate {
@@ -196,6 +208,8 @@ export const api = {
   /** What the singer actually sings, heard by Whisper; `prompt` (the published lyrics) primes it. */
   /** The original singer's melody, from the separated vocal (about a second, then cached). */
   melodyNotes: (source: string) => invoke<MelodyNote[]>("melody_notes", { source }),
+  /** The song's beat, from its separated instrumental (a second or two, then cached). */
+  songBeats: (source: string) => invoke<Beats>("song_beats", { source }),
   /** `language`: "vi", or null for Whisper to detect it. */
   transcribeVocal: (source: string, prompt: string | null, language: string | null) =>
     invoke<HeardLine[]>("transcribe_vocal", { source, prompt, language }),
@@ -234,6 +248,11 @@ export function onTick(cb: (t: Tick) => void): Promise<UnlistenFn> {
 
 export function onSetupProgress(cb: (p: { step: string; label: string; fraction: number }) => void) {
   return listen<{ step: string; label: string; fraction: number }>("setup://progress", (e) => cb(e.payload));
+}
+
+/** Splitting a recording's own backing vocals (minutes, the first time). */
+export function onBackingProgress(cb: (p: { source: string; fraction: number }) => void) {
+  return listen<{ source: string; fraction: number }>("backing://progress", (e) => cb(e.payload));
 }
 
 export function onSeparateProgress(cb: (p: SeparateProgress) => void) {

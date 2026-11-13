@@ -1,5 +1,5 @@
 import { create } from "zustand";
-import { api, type AudioStatus, type MelodyNote, type PitchPoint, type Score, type SeparateProgress, type SongInfo, type SongMeta, type Tick, type ToolStatus } from "./api";
+import { api, type AudioStatus, type Beats, type MelodyNote, type PitchPoint, type Score, type SeparateProgress, type SongInfo, type SongMeta, type Tick, type ToolStatus } from "./api";
 import type { Line } from "./lrc";
 import { DEFAULT_PARAMS, type Params } from "./presets";
 import type { Ranked } from "./sources";
@@ -39,6 +39,8 @@ export interface SongState {
   trim?: { start: number; end: number };
   /** The original singer's melody, for the note bars (null until found). */
   melody?: MelodyNote[] | null;
+  /** The song's beat, for counting in on it (null until found). */
+  beats?: Beats | null;
   /** The recording's HD video for the background (when wanted). */
   video?: { status: "loading" | "ready" | "error"; path?: string; progress: number; message?: string } | null;
   /** Autotune key follows the detected song key. */
@@ -68,6 +70,16 @@ const PREFS_KEY = "openkaraoke.audio.v1";
 const HISTORY_KEY = "openkaraoke.history.v1";
 // Per-song values that should not survive a restart.
 const VIDEO_BG_KEY = "openkaraoke.videoBg.v1";
+const AIDS_KEY = "openkaraoke.aids.v3";
+
+/** How the original melody is shown: a ribbon under the line, dots over the words, or a lane of notes. */
+export type MelodyLook = "ribbon" | "dots" | "lane";
+/** Singing aids: the melody (`pitch` on, as `look`) and countdowns on the beat. */
+export interface Aids {
+  pitch: boolean;
+  look: MelodyLook;
+  beat: boolean;
+}
 const TRANSIENT = new Set(["tune_key", "tune_scale", "drone"]);
 const MY_PRESETS_KEY = "openkaraoke.mypresets.v1";
 
@@ -104,6 +116,9 @@ interface Store {
   /** The karaoke video being exported, if any (it runs whatever view is open). */
   exportJob: { title: string; progress: number } | null;
   setVideoBg: (on: boolean) => void;
+  /** Singing aids on the lyrics (stage and exports): the melody ribbon under the line, countdowns on the song's beat. */
+  aids: Aids;
+  setAids: (a: Partial<Aids>) => void;
   params: Params;
   song: SongState | null;
   history: SongMeta[];
@@ -140,6 +155,8 @@ interface Store {
   dismiss: (id: number) => void;
   pushHistory: (m: SongMeta) => void;
   removeHistory: (id: string) => void;
+  /** Change a song's name in the history where it is (no reordering). */
+  renameHistory: (id: string, title: string, artist: string) => void;
   set: (p: Partial<Store>) => void;
 }
 
@@ -200,6 +217,16 @@ export const useStore = create<Store>((set, get) => ({
   audio: null,
   audioPrefs: load<AudioPrefs>(PREFS_KEY, { input: null, output: null, buffer: 256 }),
   exportJob: null,
+  aids: { pitch: true, look: "ribbon", beat: true, ...load<Partial<Aids>>(AIDS_KEY, {}) },
+  setAids: (a) => {
+    const aids = { ...get().aids, ...a };
+    set({ aids });
+    try {
+      localStorage.setItem(AIDS_KEY, JSON.stringify(aids));
+    } catch {
+      /* storage unavailable */
+    }
+  },
   videoBg: (() => {
     try {
       return localStorage.getItem(VIDEO_BG_KEY) === "1";
@@ -276,6 +303,7 @@ export const useStore = create<Store>((set, get) => ({
   dismiss: (id) => set({ toasts: get().toasts.filter((t) => t.id !== id) }),
   pushHistory: (m) => saveHistory([m, ...get().history.filter((h) => h.id !== m.id)].slice(0, 12)),
   removeHistory: (id) => saveHistory(get().history.filter((h) => h.id !== id)),
+  renameHistory: (id, title, artist) => saveHistory(get().history.map((h) => (h.id === id ? { ...h, title, artist } : h))),
   set: (p) => {
     set(p);
     if (p.audioPrefs) {
@@ -296,19 +324,31 @@ export function syncAllParams() {
 // ---------------------------------------------------------------- clock --
 // Ticks arrive ~30×/s; animation interpolates between them.
 
-const clock = { pos: 0, at: 0, playing: false, shown: 0 };
+const clock = { pos: 0, at: 0, playing: false, shown: 0, wall: 0 };
 
-/** Backward steps smaller than this are tick jitter, not a seek. */
+/** A difference from the ticks bigger than this is a seek: jump to it. */
 const JITTER = 0.25;
+/** How fast the shown time catches up with the ticks (per second). */
+const CATCH_UP = 3;
 
+/**
+ * The song's position for animation. It runs on the frame clock at exactly
+ * real speed and is steered gently toward the engine's ticks, rather than
+ * re-set by each one: ticks arrive ~30×/s with jitter and the audio position
+ * moves in device-buffer steps, so following them directly made the lyric
+ * wipe stutter (stall, then jump). A seek or a real drift still jumps.
+ */
 export function songTime(): number {
+  const now = performance.now();
+  const dt = Math.min(0.1, Math.max(0, (now - clock.wall) / 1000));
+  clock.wall = now;
   if (!clock.playing) return (clock.shown = clock.pos);
   // The engine plays the rendered (tempo-adjusted) track in real time.
-  const t = clock.pos + Math.min(0.12, (performance.now() - clock.at) / 1000);
-  // Extrapolating between ticks runs a few ms ahead of the next tick; never
-  // step back for that, or lyrics flicker between lines at every boundary.
-  if (t < clock.shown && clock.shown - t < JITTER) return clock.shown;
-  return (clock.shown = t);
+  const target = clock.pos + Math.min(0.12, (now - clock.at) / 1000);
+  if (Math.abs(target - clock.shown) > JITTER) return (clock.shown = target);
+  const next = clock.shown + dt;
+  // Never step back: lyrics would flicker between lines at a boundary.
+  return (clock.shown = Math.max(clock.shown, next + (target - next) * Math.min(1, dt * CATCH_UP)));
 }
 
 // ---------------------------------------------------------------- pitch --

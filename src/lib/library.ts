@@ -19,7 +19,17 @@ export interface SongSettings {
   /** This song's mix: backing track, guide vocal, harmony and original-singer levels. */
   mix?: Record<string, number>;
   /** This song's automatic harmony (scale steps, empty = off) and its style. */
-  backing?: { degrees: number[]; style: "choir" | "voice" };
+  backing?: { degrees: number[]; style: "choir" | "voice" | "original" };
+}
+
+/** A song's video export choices. */
+export interface ExportPrefs {
+  orientation: "landscape" | "portrait";
+  style: "scroll" | "classic" | "subtitle";
+  backdrop: "video" | "artwork" | "plain" | "image";
+  fps: 30 | 25;
+  /** This song's own background picture (a copy in the cache). */
+  image?: string;
 }
 
 /** A fitted line the aligner could hardly find in the vocal: worth checking by hand. */
@@ -41,6 +51,8 @@ export interface SongParts {
   laps?: Record<string, ["auto" | "female" | "male" | "none", "auto" | "female" | "male" | "none"]>;
   /** Duets: which lines the female or male singer (or both) sings, as line spans in the recording. Shown on the lyrics. */
   singers?: Partial<Record<"female" | "male" | "both", [number, number][]>>;
+  /** False once the user cleared the harmony lines by hand: then "on the whole song" is meant. */
+  autoBacking?: boolean;
 }
 
 /** Lyrics the user picked from a search or pasted, and what they searched for. */
@@ -65,6 +77,8 @@ export interface LibraryEntry {
   /** Lyrics re-timed to the recording `sourceId` by forced alignment. */
   aligned?: { sourceId: string; lines: Line[]; v?: number; issues?: LyricIssue[] };
   settings?: SongSettings;
+  /** How this song's karaoke video is exported (each song its own). */
+  exportPrefs?: ExportPrefs;
   /** Words the user corrected: "<original line text>|<word index>" → text.
    * Keyed by the line's text, so a fix applies to every repeat of a chorus
    * line and survives re-fitting the lyrics. */

@@ -1,13 +1,16 @@
 pub mod align;
 pub mod analysis;
 pub mod backing;
+pub mod beats;
 pub mod chain;
+pub mod chords;
 pub mod decode;
 pub mod duet;
 pub mod engine;
 pub mod exclusive;
 pub mod fx;
 pub mod isolate;
+pub mod karaoke;
 pub mod melody;
 pub mod params;
 pub mod pitch;

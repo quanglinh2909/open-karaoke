@@ -15,6 +15,8 @@ import {
   type Video,
   type WordTime,
   type BackingStyle,
+  ENERGY_STEP,
+  onBackingProgress,
 } from "./api";
 import {
   alternatives,
@@ -37,7 +39,7 @@ import {
 import { parseLrc, type Line } from "./lrc";
 import { mod12, SCALE_MAJOR, SCALE_MINOR } from "./music";
 import { DEFAULT_PARAMS } from "./presets";
-import { leadParts, lineSingers, normalizeParts, savedSegments, type Singer } from "./parts";
+import { leadParts, lineSingers, normalizeParts, savedSegments, suggestHarmony, toParts, type HarmonySuggestion, type Singer } from "./parts";
 import { rankOriginals, type Ranked } from "./sources";
 import { resetPitchTrail, useStore, type SongState } from "./store";
 
@@ -151,6 +153,31 @@ export function rememberLyricsSearch(songId: string, title: string, artist: stri
   const q = { title: title.trim(), artist: artist.trim() };
   lyricsQueries.set(songId, q);
   saveToLibrary(songId, { lyricsQuery: q });
+  // The corrected name is the song's name from now on: stage, home, exports.
+  if (!q.title) return;
+  const song = st().song;
+  const named = song?.meta.id === songId ? song.meta : st().history.find((h) => h.id === songId);
+  if (!named) return;
+  const meta = withName(named, q);
+  if (song?.meta.id === songId) st().patchSong({ meta });
+  st().renameHistory(songId, meta.title, meta.artist);
+}
+
+// Songs renamed before the name was shown everywhere: their home cards too.
+for (const h of st().history) {
+  const q = libraryEntry(h.id)?.lyricsQuery;
+  if (q?.title && (q.title !== h.title || (q.artist && q.artist !== h.artist) || h.artist.trim().toLowerCase() === q.title.trim().toLowerCase())) {
+    const m = withName(h, q);
+    st().renameHistory(h.id, m.title, m.artist);
+  }
+}
+
+/** `meta` under the name the user gave the song (its corrected title, and artist when given). */
+function withName(meta: SongMeta, q: { title: string; artist: string } | null | undefined): SongMeta {
+  if (!q?.title) return meta;
+  // An "artist" guessed from the video title that is really the song's name is no artist.
+  const kept = meta.artist.trim().toLowerCase() === q.title.trim().toLowerCase() ? "" : meta.artist;
+  return { ...meta, title: q.title, artist: q.artist || kept };
 }
 
 /** The title and artist to search lyrics under: the user's last search, else the song's. */
@@ -675,7 +702,9 @@ async function shiftWhole(
 }
 
 /** Search for the original → download → AI separation. Lyrics load in parallel. */
-export async function openSong(meta: SongMeta) {
+export async function openSong(opened: SongMeta) {
+  // Under the name the user corrected it to, if they did.
+  const meta = withName(opened, libraryEntry(opened.id)?.lyricsQuery);
   const token = ++loadToken;
   resetPitchTrail();
   await api.pause().catch(() => {});
@@ -864,6 +893,7 @@ async function buildFrom(video: Video, token: number, cachedPath?: string) {
     );
     void autoAlign(token).finally(() => restoreSettings(token));
     void loadMelody(token);
+    void loadBeats(token);
     void applyBacking(token);
   } catch (e) {
     if (!isCurrent(token) || errorText(e) === "superseded") return;
@@ -921,17 +951,61 @@ export function backingChoice(): { degrees: number[]; style: BackingStyle } {
 const pendingBacking = new Map<string, { degrees: number[]; style: BackingStyle }>();
 
 /** Choose the automatic harmony and make it for the open song (a few seconds). */
+/** Where the open song's harmony belongs (chorus, climaxes, held notes), from its lyrics and loudness. */
+export function suggestBacking(): HarmonySuggestion | null {
+  const song = st().song;
+  const lines = song?.lyrics.lines;
+  if (!song || !lines?.length) return null;
+  return suggestHarmony(lines, song.beats?.energy, ENERGY_STEP, song.userOffset);
+}
+
+/**
+ * A harmony turned on for a song whose harmony lines were never chosen: put
+ * it where an arranger would (the suggestion) rather than on the whole song.
+ * Returns how many lines got it, 0 if left as it was.
+ */
+async function placeBackingFirstTime(): Promise<number> {
+  const song = st().song;
+  const lines = song?.lyrics.lines;
+  if (!song || !lines?.length) return 0;
+  const saved = songParts(song.meta.id);
+  if (saved.backing.length || saved.autoBacking === false) return 0;
+  const sugg = suggestBacking();
+  if (!sugg?.lines.size) return 0;
+  const backing = toParts(lines, sugg.lines, song.userOffset);
+  const parts = { ...saved, backing };
+  saveToLibrary(song.meta.id, { parts });
+  const lead = saved.original.length ? leadParts(savedSegments(lines, saved.original, song.userOffset), saved.adjust?.original, saved.laps) : [];
+  await api.songParts(backing, lead).catch(() => undefined);
+  return sugg.lines.size;
+}
+
 export async function setBacking(degrees: number[], style: BackingStyle) {
+  // Leaving the record's own backing (as loud as the music): back to a generated harmony's level.
+  const was = backingChoice();
+  if (was.degrees.length && was.style === "original" && style !== "original" && degrees.length) st().setParam("backing", 0.35);
   const id = st().song?.meta.id;
   if (id) {
     pendingBacking.set(id, { degrees, style });
     saveSettings();
   }
-  st().patchSong({ busy: degrees.length ? "Đang tạo bè…" : null });
+  st().patchSong({ busy: degrees.length ? (style === "original" ? "Đang tách bè gốc…" : "Đang tạo bè…") : null });
+  followMusic();
   try {
+    // The record's own backing sings only where the record has it: no placing.
+    const placed = degrees.length && style !== "original" ? await placeBackingFirstTime() : 0;
     await api.songBacking(degrees, style);
-    if (degrees.length)
-      st().toast(style === "choir" ? "Đã tạo bè hợp xướng theo giai điệu bài." : "Đã tạo bè từ giọng ca sĩ gốc.", "success");
+    // (The record's own backing says so itself when its first split is done.)
+    if (degrees.length && style !== "original")
+      st().toast(
+        (style === "choir"
+          ? "Đã tạo bè hợp xướng theo giai điệu bài."
+          : style === "voice"
+            ? "Đã tạo bè từ giọng ca sĩ gốc."
+            : "Đã tách bè gốc của bài: bè vang lên đúng những chỗ bản thu có bè.") +
+          (placed ? ` Bè đặt ở ${placed} dòng điệp khúc và cao trào; sửa ở ✂ Phân đoạn.` : ""),
+        "success",
+      );
   } catch (e) {
     if (errorText(e) !== "superseded") st().toast(`Không tạo được bè: ${errorText(e)}`, "error");
   } finally {
@@ -996,8 +1070,37 @@ async function applyBacking(token: number) {
   }
   const { degrees, style } = backingChoice();
   if (!degrees.length || !isCurrent(token) || !song?.info || song.info.separating || song.info.vocalRemoved) return;
+  followMusic();
   // The choir follows the melody: have it first (cached after the first time).
   await api.songBacking(degrees, style).catch(() => undefined);
+}
+
+/**
+ * The record's own backing is as loud as on the record: its level follows
+ * the instrumental's (the two were mixed together in the studio), so it has
+ * no level of its own to set.
+ */
+function followMusic() {
+  const { degrees, style } = backingChoice();
+  if (!degrees.length || style !== "original") return;
+  const p = st().params;
+  if (p.instrumental !== undefined && p.backing !== p.instrumental) st().setParam("backing", p.instrumental);
+}
+useStore.subscribe((s, prev) => {
+  if (s.params.instrumental !== prev.params.instrumental) followMusic();
+});
+
+// Splitting a song's own backing takes minutes: say when it is done, from any tab.
+void onBackingProgress((p) => {
+  if (p.fraction >= 1 && p.source === st().song?.sourceId) st().toast("Đã tách xong bè gốc của bài: bè đã vang lên ở những chỗ bài có bè.", "success");
+});
+
+/** Find the song's beat (once per recording, then cached) for countdowns on the beat. */
+async function loadBeats(token: number) {
+  const song = st().song;
+  if (!isCurrent(token) || !song?.sourceId || !song.info || song.info.separating || song.info.vocalRemoved || song.beats) return;
+  const beats = await api.songBeats(song.sourceId).catch(() => null);
+  if (isCurrent(token) && beats) st().patchSong({ beats });
 }
 
 /** Find the original singer's melody (once per recording, then cached) for the note bars. */
@@ -1158,6 +1261,7 @@ export function listenForSeparation() {
     });
     void autoAlign(job).finally(() => restoreSettings(job));
     void loadMelody(job);
+    void loadBeats(job);
     void applyBacking(job);
   });
   const failed = onSeparateError(({ job, message }) => {
@@ -1181,6 +1285,7 @@ export async function switchSource(r: Ranked) {
     info: null,
     restored: false,
     melody: null,
+    beats: null,
     video: null,
   });
   await buildFrom(r.video, token);

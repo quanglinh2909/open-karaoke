@@ -207,7 +207,7 @@ export function Stage() {
       <div className={`stage-bg ${videoPath ? "video-on" : ""}`}>
         {videoPath ? <StageVideo path={videoPath} /> : song.meta.artwork && <img src={song.meta.artwork} alt="" />}
       </div>
-      <div className="stage-main">
+      <div className={`stage-main ${fresh ? "starting" : ""}`}>
         <div className="song-head">
           {song.meta.artwork ? <img src={song.meta.artwork} alt="" /> : <div className="art-ph" />}
           <div className="meta">

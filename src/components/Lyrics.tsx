@@ -1,10 +1,14 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { deleteLine, fixWord, hasFixes, lyricIssues, lyricsBusy, lyricsFitted, refitWithFixes, songSingers, startLyrics } from "../lib/loader";
 import { lineAt, type Line } from "../lib/lrc";
 import { SINGER_LABEL } from "../lib/parts";
 import {
   ANCHOR,
+  clamp01,
   cueAt,
+  linePitch,
+  phraseStarts,
+  type PitchSeg,
   entryRing,
   focusAt,
   holdLength,
@@ -12,6 +16,11 @@ import {
   lineJoin,
   restAfter,
   wordProgress,
+  wipeEdge,
+  litAlong,
+  restAt,
+  breath,
+  wavyTail,
 } from "../lib/lyricCues";
 import { songTime, useStore } from "../lib/store";
 
@@ -126,6 +135,244 @@ export function Lyrics() {
   );
 }
 
+/** Where `el` sits inside `root` (layout offsets: unaffected by the scale transitions). */
+function offsetIn(el: HTMLElement, root: HTMLElement): { x: number; y: number } | null {
+  let x = 0;
+  let y = 0;
+  let n: HTMLElement | null = el;
+  while (n && n !== root) {
+    x += n.offsetLeft;
+    y += n.offsetTop;
+    n = n.offsetParent as HTMLElement | null;
+  }
+  return n === root ? { x, y } : null;
+}
+
+/**
+ * The melody ribbon under the line being sung (as in exported videos): a
+ * thin line rising and falling with the original melody under the words,
+ * lit up to where the singing is, a dot there. Drawn as SVG over the line
+ * from the words' laid-out positions; lit each frame.
+ */
+function Ribbon({
+  mode,
+  line,
+  segs,
+  lineEl,
+  wordEls,
+}: {
+  /** "ribbon": a line under the words; "dots": a dot per note over them. */
+  mode: "ribbon" | "dots";
+  line: Line;
+  segs: PitchSeg[][];
+  lineEl: HTMLElement | null;
+  wordEls: (HTMLSpanElement | null)[];
+}) {
+  type Row = {
+    d: string;
+    x0: number;
+    x1: number;
+    pts: [number, number][];
+    words: { k: number; x: number; w: number }[];
+    /** Held notes' trails (where the light runs on while the note is held). */
+    tails: { k: number; x: number; w: number }[];
+    /** Dots mode: each note's dot and when it is sung. */
+    dots: { x: number; y: number; at: number }[];
+  };
+  const dotRefs = useRef<(SVGCircleElement | null)[][]>([]);
+  const [rows, setRows] = useState<Row[]>([]);
+  const clipEls = useRef<(SVGRectElement | null)[]>([]);
+  const dotEls = useRef<(SVGCircleElement | null)[]>([]);
+  /** A small ring round the dot that fills during a rest, until the next word. */
+  const ringEls = useRef<(SVGGElement | null)[]>([]);
+  const id = useRef(`rb${Math.random().toString(36).slice(2, 8)}`).current;
+
+  useLayoutEffect(() => {
+    if (!lineEl) return;
+    const measure = () => {
+      const fs = parseFloat(getComputedStyle(lineEl).fontSize) || 40;
+      const byRow = new Map<number, Row>();
+      line.words.forEach((_, k) => {
+        const ws = segs[k];
+        const el = wordEls[k]?.querySelector<HTMLElement>(".w");
+        if (!ws?.length || !el) return;
+        const at = offsetIn(el, lineEl);
+        if (!at) return;
+        const key = Math.round(at.y / 4);
+        const row = byRow.get(key) ?? { d: "", x0: Infinity, x1: -Infinity, pts: [], words: [], tails: [], dots: [] };
+        const bottom = at.y + el.offsetHeight;
+        const w = el.offsetWidth;
+        const word = line.words[k];
+        const dur = Math.max(0.08, word.end - word.start);
+        for (const sg of ws) row.dots.push({ x: at.x + ((sg.from + sg.to) / 2) * w, y: at.y + fs * 0.02 - sg.h * fs * 0.3, at: word.start + sg.from * dur });
+        for (const sg of ws) {
+          const prev = row.pts.length ? row.pts[row.pts.length - 1][0] : -Infinity;
+          const a = Math.max(prev + fs * 0.02, at.x + sg.from * w + fs * 0.05);
+          const b = Math.max(a + fs * 0.04, at.x + sg.to * w - fs * 0.05);
+          const y = bottom + fs * 0.06 + (1 - sg.h) * fs * 0.32;
+          row.pts.push([a, y], [b, y]);
+        }
+        row.words.push({ k, x: at.x, w });
+        // A held note: the ribbon runs on under its trail, gently waving.
+        const hold = wordEls[k]?.querySelector<HTMLElement>(".hold");
+        const tail = hold ? offsetIn(hold, lineEl) : null;
+        if (hold && tail && row.pts.length) {
+          const y = row.pts[row.pts.length - 1][1];
+          row.pts.push(...wavyTail(row.pts[row.pts.length - 1][0], tail.x + hold.offsetWidth, y, fs * 0.035, fs * 0.16));
+          row.tails.push({ k, x: tail.x, w: hold.offsetWidth });
+        }
+        byRow.set(key, row);
+      });
+      const out = [...byRow.values()].filter((r) => r.pts.length >= 2);
+      for (const r of out) {
+        if (mode === "dots") {
+          r.d = r.dots.map((p, k) => `${k ? "L" : "M"}${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ");
+          continue;
+        }
+        const P = r.pts;
+        r.x0 = P[0][0];
+        r.x1 = P[P.length - 1][0];
+        r.d = `M${P[0][0].toFixed(1)},${P[0][1].toFixed(1)}` + P.slice(1).map((p, k) => {
+          const [px, py] = P[k];
+          const mx = ((px + p[0]) / 2).toFixed(1);
+          return ` C${mx},${py.toFixed(1)} ${mx},${p[1].toFixed(1)} ${p[0].toFixed(1)},${p[1].toFixed(1)}`;
+        }).join("");
+      }
+      setRows(out);
+    };
+    measure();
+    const ro = new ResizeObserver(measure);
+    ro.observe(lineEl);
+    void document.fonts.ready.then(measure);
+    return () => ro.disconnect();
+  }, [line, segs, lineEl, wordEls, mode]);
+
+  useEffect(() => {
+    let raf = 0;
+    const loop = () => {
+      const t = lyricClock();
+      if (mode === "dots") {
+        rows.forEach((r, n) => r.dots.forEach((d, k) => dotRefs.current[n]?.[k]?.classList.toggle("on", t >= d.at)));
+        raf = requestAnimationFrame(loop);
+        return;
+      }
+      rows.forEach((r, n) => {
+        // With the text's wipe, crossing the spaces too, and on along a held note's trail.
+        let lit = litAlong(line, r.words, t);
+        for (const tl of r.tails) {
+          const { hold } = wordProgress(line.words[tl.k], t, tl.k === line.words.length - 1, line, tl.k);
+          if (hold > 0) lit = Math.max(lit, tl.x + hold * tl.w);
+        }
+        const to = Math.min(Math.max(lit, r.x0), r.x1);
+        clipEls.current[n]?.setAttribute("width", Math.max(0, to - r.x0 + 2).toFixed(1));
+        const dot = dotEls.current[n];
+        if (dot) {
+          const on = lit > r.x0 && lit < r.x1;
+          dot.style.opacity = on ? "1" : "0";
+          // Resting: the dot breathes, so stillness reads as a rest, not a stop.
+          const rest = restAt(line, t);
+          const restLen = rest ? line.words[rest.k + 1].start - line.words[rest.k].end : 0;
+          dot.style.transform = rest ? `scale(${breath(rest.f, restLen).toFixed(3)})` : "";
+          const ring = ringEls.current[n];
+          if (ring) {
+            ring.style.opacity = on && rest ? "1" : "0";
+            ring.style.setProperty("--r", rest ? rest.f.toFixed(3) : "0");
+          }
+          if (on) {
+            const P = r.pts;
+            let y = P[0][1];
+            for (let k = 1; k < P.length; k++) {
+              if (P[k][0] >= to) {
+                const u = clamp01((to - P[k - 1][0]) / Math.max(1, P[k][0] - P[k - 1][0]));
+                y = P[k - 1][1] + (P[k][1] - P[k - 1][1]) * (u < 0.5 ? 2 * u * u : 1 - 2 * (1 - u) * (1 - u));
+                break;
+              }
+            }
+            dot.setAttribute("cx", to.toFixed(1));
+            dot.setAttribute("cy", y.toFixed(1));
+            ringEls.current[n]?.setAttribute("transform", `translate(${to.toFixed(1)} ${y.toFixed(1)}) rotate(-90)`);
+          }
+        }
+      });
+      raf = requestAnimationFrame(loop);
+    };
+    raf = requestAnimationFrame(loop);
+    return () => cancelAnimationFrame(raf);
+  }, [rows, line, mode]);
+
+  if (mode === "dots")
+    return (
+      <svg className="ribbon dots" aria-hidden>
+        {rows.map((r, n) => (
+          <g key={n}>
+            <path className="rb-base" d={r.d} />
+            {r.dots.map((d, k) => (
+              <circle
+                key={k}
+                className="rb-note"
+                cx={d.x}
+                cy={d.y}
+                r={3}
+                ref={(el) => {
+                  (dotRefs.current[n] ??= [])[k] = el;
+                }}
+              />
+            ))}
+          </g>
+        ))}
+      </svg>
+    );
+  return (
+    <svg className="ribbon" aria-hidden>
+      <defs>
+        {rows.map((r, n) => (
+          <clipPath key={n} id={`${id}-${n}`}>
+            <rect
+              ref={(el) => {
+                clipEls.current[n] = el;
+              }}
+              x={r.x0 - 1}
+              y={-9999}
+              width={0}
+              height={99999}
+            />
+          </clipPath>
+        ))}
+      </defs>
+      {rows.map((r, n) => (
+        <g key={n}>
+          <path className="rb-base" d={r.d} />
+          <path className="rb-lit" d={r.d} clipPath={`url(#${id}-${n})`} />
+          <circle
+            className="rb-dot"
+            r={3.5}
+            ref={(el) => {
+              dotEls.current[n] = el;
+            }}
+          />
+          <g
+            className="rb-ring"
+            ref={(el) => {
+              ringEls.current[n] = el;
+            }}
+          >
+            <circle className="rb-ring-bg" r={8} />
+            <circle className="rb-ring-fill" r={8} pathLength={1} />
+          </g>
+        </g>
+      ))}
+    </svg>
+  );
+}
+
+/** A line's words grouped into its phrases (word indexes), split at its breaths and pauses. */
+function phrasesOf(line: Line): number[][] {
+  const starts = phraseStarts(line);
+  const out: number[][] = [];
+  line.words.forEach((_, k) => (starts[k] || !out.length ? out.push([k]) : out[out.length - 1].push(k)));
+  return out;
+}
+
 function SyncedLyrics({ lines }: { lines: Line[] }) {
   const meta = useStore((s) => s.song?.meta);
   // Lines the last fit could hardly place: marked ⚠ for the user to check.
@@ -134,6 +381,17 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
   // Duets: who sings each line (marked on the parts page; re-read when it closes).
   useStore((s) => s.partsEditor);
   const singers = songSingers();
+  // Singing aids: pitch marks over the words and countdowns on the beat.
+  // The melody on the words (ribbon under / dots over); the lane is the note graph below.
+  const look = useStore((s) => s.aids.look);
+  const notes = useStore((s) => (s.aids.pitch && s.aids.look !== "lane" ? s.song?.melody : null));
+  const beatTimes = useStore((s) => (s.aids.beat ? s.song?.beats?.times : null));
+  const offset = useStore((s) => s.song?.userOffset ?? 0);
+  const pitches = useMemo(() => lines.map((l) => linePitch(l, notes, offset)), [lines, notes, offset]);
+  const pitchOn = pitches.some(Boolean);
+  // Beats in lyric time, read by the frame loop.
+  const beatsRef = useRef<number[] | null>(null);
+  beatsRef.current = useMemo(() => beatTimes?.map((b) => b - offset) ?? null, [beatTimes, offset]);
   const [focus, setFocus] = useState(-1);
   /** The word being corrected (double-click), if any. */
   const [editing, setEditing] = useState<{ li: number; k: number } | null>(
@@ -169,15 +427,17 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
         const el = els[k];
         if (!el) return;
         // A held note lights up quickly, then its bar shows how long to hold.
-        const { lit, hold, held } = wordProgress(w, t, k === last);
-        el.style.setProperty("--p", `${(lit * 100).toFixed(1)}%`);
+        const { hold, held } = wordProgress(w, t, k === last, line, k);
+        // The soft edge of the wipe, sliding through the whole line.
+        const edge = wipeEdge(line, k, t);
+        el.style.setProperty("--p", `${(edge.from * 100).toFixed(1)}%`);
+        el.style.setProperty("--q", `${(edge.to * 100).toFixed(1)}%`);
         if (held) el.style.setProperty("--h", `${(hold * 100).toFixed(1)}%`);
         el.classList.toggle("sung", t >= w.end);
         // Rest marks (and the line-end mark) light up while it is time to rest.
         const rest = restEls.current[li]?.[k];
         const until = k < last ? line.words[k + 1].start : lines[li + 1]?.start;
-        if (rest && until !== undefined)
-          rest.classList.toggle("on", t >= w.end && t < until);
+        if (rest && until !== undefined) rest.classList.toggle("on", t >= w.end && t < until);
       });
       const ring = entryEls.current[li];
       if (ring) {
@@ -209,7 +469,7 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
 
       // One moving cue at a time: the wipe while singing, the countdown
       // before a line; nothing animates on the line that is still to come.
-      const { count, dots, breakLeft, bar, intro } = cueAt(lines, i, t);
+      const { count, dots, breakLeft, bar, intro } = cueAt(lines, i, t, beatsRef.current);
       if (breakLeft && barEl.current)
         barEl.current.style.width = `${(bar * 100).toFixed(1)}%`;
       const c = cueRef.current;
@@ -266,7 +526,7 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
   };
 
   return (
-    <div className="lyrics synced" ref={boxEl}>
+    <div className={`lyrics synced ${pitchOn ? "pitch-on" : ""}`} ref={boxEl}>
       <AlignNote />
       <LyricsActions />
       <div className="lyric-track" ref={trackEl}>
@@ -295,6 +555,12 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
             <span>
               <b>●</b>sáng rõ là vào câu
             </span>
+            {pitchOn && (
+              <span>
+                <b>{look === "dots" ? "•" : "∿"}</b>
+                {look === "dots" ? "giai điệu (chấm trên chữ)" : "giai điệu (đường dưới câu)"}
+              </span>
+            )}
           </div>
         </div>
         {lines.map((line, li) => (
@@ -313,12 +579,19 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
               ✕
             </button>
             {singers[li] && <span className="singer-tag">{SINGER_LABEL[singers[li]!]}</span>}
+            {li === focus && pitches[li] && (
+              <Ribbon mode={look === "dots" ? "dots" : "ribbon"} line={line} segs={pitches[li]!} lineEl={itemEls.current[li + 1]} wordEls={wordEls.current[li] ?? []} />
+            )}
             {doubtful(line) && (
               <span className="doubt-mark" title="Dòng này canh có thể sai: kiểm tra ở tab Bài hát → Dòng cần kiểm tra">
                 ⚠
               </span>
             )}
-            {line.words.map((w, k) => {
+            {phrasesOf(line).map((ks) => (
+              <Fragment key={ks[0]}>
+              <span className="phrase">
+            {ks.map((k) => {
+              const w = line.words[k];
               const last = k === line.words.length - 1;
               const held = isHeld(w, last);
               // After the last word: how the line leads into the next.
@@ -398,6 +671,9 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
                 </span>
               );
             })}
+              </span>{" "}
+              </Fragment>
+            ))}
           </div>
         ))}
       </div>
@@ -416,7 +692,7 @@ function SyncedLyrics({ lines }: { lines: Line[] }) {
           className="countdown"
           style={{ visibility: cue.count > 0 ? "visible" : "hidden" }}
         >
-          {[3, 2, 1].slice(3 - cue.dots).map((n) => (
+          {Array.from({ length: cue.dots }, (_, j) => cue.dots - j).map((n) => (
             <span
               key={n}
               className={cue.count > 0 && cue.count <= n ? "on" : ""}

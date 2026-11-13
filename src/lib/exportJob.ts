@@ -1,7 +1,7 @@
 import { revealItemInDir } from "@tauri-apps/plugin-opener";
 import { errorText } from "./api";
 import { useStore } from "./store";
-import { exportKaraokeVideo, type Backdrop, type LyricStyle, type Orientation } from "./videoExport";
+import { exportKaraokeVideo, type Backdrop, type FrameRate, type LyricStyle, type Orientation } from "./videoExport";
 
 /** Set to stop the running export at its next frame. */
 let stopRequested = false;
@@ -11,7 +11,7 @@ let stopRequested = false;
  * any panel: switching tabs, going home or opening another song doesn't
  * stop it, and the corner indicator shows its progress throughout.
  */
-export async function startExport(orientation: Orientation, style: LyricStyle, backdrop: Backdrop) {
+export async function startExport(orientation: Orientation, style: LyricStyle, backdrop: Backdrop, fps: FrameRate = 30) {
   const s = useStore.getState();
   if (s.exportJob || !s.song) return;
   stopRequested = false;
@@ -31,6 +31,7 @@ export async function startExport(orientation: Orientation, style: LyricStyle, b
         }
       },
       () => stopRequested,
+      fps,
     );
     useStore.getState().toast(`Đã xuất video karaoke "${title}"`, "success", { label: "Xem", run: () => revealItemInDir(path) });
   } catch (e) {

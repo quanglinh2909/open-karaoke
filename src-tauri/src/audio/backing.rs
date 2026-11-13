@@ -7,7 +7,9 @@
 //! diatonic shift resynthesised with TD-PSOLA. It runs offline over the whole
 //! vocal, so it can take its time and its latency is simply cut off.
 
-use super::melody::{note_at, Note};
+use super::chords::{chord_at, Chord};
+use super::fx::{Biquad, DeEsser, Reverb, Shape};
+use super::melody::Note;
 use super::pitch::PitchDetector;
 use super::psola::{Psola, VoiceTarget, MAX_VOICES};
 use super::scale;
@@ -29,6 +31,53 @@ const FADE_OUT: f32 = 0.04;
 const MAJOR: usize = 1;
 const MINOR: usize = 2;
 
+/// The harmony note (MIDI) a voice sings for each of the melody's `notes`:
+/// `deg` scale steps away (+2 = a third above) as the plain rule, but where
+/// the chord being played is known, the chord's note nearest that, as an
+/// arranger would: a third up the scale clashes wherever the chord isn't
+/// the scale's own (a melody E in C major over an E major chord: G#, the
+/// chord's, not the scale's G). Voice leading: a chord note the voice
+/// already holds is kept rather than jumping to an equally good one.
+pub fn plan(notes: &[Note], deg: i32, tonic: i32, sc: &[u8], chords: &[Chord]) -> Vec<i32> {
+    let mut prev: Option<(i32, f32)> = None;
+    notes
+        .iter()
+        .map(|n| {
+            let base = scale::nearest(n.midi, tonic, sc);
+            let rule = scale::shift_degrees(base, deg, tonic, sc);
+            // The chord under the note's onset (just after it: chords change on the beat).
+            let at = n.start + (0.5 * (n.end - n.start)).min(0.15);
+            let held = prev.filter(|(_, end)| n.start - end < 0.8).map(|(m, _)| m);
+            let harm = match chord_at(chords, at) {
+                Some(c) if deg.abs() != 7 => {
+                    let want = (rule - base).abs();
+                    let dir = deg.signum();
+                    // Chord notes on the voice's side, from a minor third up
+                    // to a whole tone either side of the rule's interval.
+                    let cands: Vec<i32> = ((want - 2).max(3)..=(want + 2)).map(|d| base + dir * d).filter(|m| c.has(*m)).collect();
+                    match held.filter(|h| cands.contains(h)) {
+                        Some(h) => h,
+                        None => cands
+                            .iter()
+                            .copied()
+                            .min_by_key(|m| ((m - rule).abs(), held.map(|h| (m - h).abs()).unwrap_or(0)))
+                            .unwrap_or(rule),
+                    }
+                }
+                _ => rule,
+            };
+            prev = Some((harm, n.end));
+            harm
+        })
+        .collect()
+}
+
+/// Index of the note sounding at `t`, if any.
+fn note_index(notes: &[Note], t: f32) -> Option<usize> {
+    let i = notes.partition_point(|n| n.end < t);
+    notes.get(i).filter(|n| n.start <= t).map(|_| i)
+}
+
 /// Harmony voices for a stereo vocal (interleaved, `sr` Hz): one voice per
 /// entry of `degrees` (scale steps, +2 = a third above, -2 a third below),
 /// in the key `tonic` (0 = C) major or minor. Returns interleaved stereo of
@@ -39,7 +88,7 @@ const MINOR: usize = 2;
 /// note, sung only inside it, faded at its edges. Snapping every 4 ms reading
 /// instead made the harmony flip between intervals on vibrato and chop on
 /// breathy instants. Without notes it falls back to that, steadied.
-pub fn harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, degrees: &[i32], notes: &[Note]) -> Vec<f32> {
+pub fn harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, degrees: &[i32], notes: &[Note], chords: &[Chord]) -> Vec<f32> {
     let frames = vocal.len() / 2;
     let voices: Vec<i32> = degrees.iter().copied().filter(|d| *d != 0).take(MAX_VOICES).collect();
     let mut out = vec![0.0f32; frames * 2];
@@ -47,10 +96,11 @@ pub fn harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, degrees: &[i32],
         return out;
     }
     if !notes.is_empty() {
-        return spectral_harmony(vocal, sr, tonic, minor, &voices, notes);
+        return spectral_harmony(vocal, sr, tonic, minor, &voices, notes, chords);
     }
     let fs = sr as f32;
     let sc = scale::scale(if minor { MINOR } else { MAJOR });
+    let plans: Vec<Vec<i32>> = voices.iter().map(|d| plan(notes, *d, tonic, sc, chords)).collect();
     let mut detector = PitchDetector::new(fs);
     let mut psola = Psola::new(fs);
     let latency = psola.latency();
@@ -80,8 +130,8 @@ pub fn harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, degrees: &[i32],
         if let Some(est) = detector.push(x) {
             let t = i as f32 / fs;
             if !notes.is_empty() {
-                match note_at(notes, t, 0.0) {
-                    Some(n) if level >= MIN_LEVEL * 0.5 => {
+                match note_index(notes, t).map(|i| (i, &notes[i])) {
+                    Some((ni, n)) if level >= MIN_LEVEL * 0.5 => {
                         let note_hz = 440.0 * 2f32.powf((n.midi - 69.0) / 12.0);
                         // The detector's period when it agrees with the note
                         // (within 2 semitones), else the note's: no octave slips.
@@ -89,8 +139,8 @@ pub fn harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, degrees: &[i32],
                         psola.set_period(Some(fs / if near { est.freq } else { note_hz }));
                         let base = scale::nearest(n.midi, tonic, sc);
                         let edge = ((t - n.start) / FADE_IN).min((n.end - t) / FADE_OUT).clamp(0.0, 1.0);
-                        for (k, deg) in voices.iter().enumerate() {
-                            let harm = scale::shift_degrees(base, *deg, tonic, sc);
+                        for (k, voice) in plans.iter().enumerate() {
+                            let harm = voice[ni];
                             let ratio = 2f32.powf((harm - base) as f32 / 12.0);
                             let formant = if harm < base { 0.97 } else { 1.0 };
                             psola.set_voice(k, VoiceTarget { active: edge > 0.0, ratio, formant, gain: edge });
@@ -146,17 +196,14 @@ const BLOCK: usize = 256;
 /// which reverb and bleed in a separated vocal spoil (cracks, chopping); this
 /// doesn't. Each voice is transposed by one interval per sung note, sounds
 /// only inside the notes and fades at their edges.
-fn spectral_harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, voices: &[i32], notes: &[Note]) -> Vec<f32> {
+fn spectral_harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, voices: &[i32], notes: &[Note], chords: &[Chord]) -> Vec<f32> {
     use signalsmith_stretch::Stretch;
     let frames = vocal.len() / 2;
     let fs = sr as f32;
     let sc = scale::scale(if minor { MINOR } else { MAJOR });
     let mono: Vec<f32> = vocal.chunks_exact(2).map(|c| 0.5 * (c[0] + c[1])).collect();
     // Each note's interval for each voice (semitones), and the fade envelope.
-    let interval = |n: &Note, deg: i32| {
-        let base = scale::nearest(n.midi, tonic, sc);
-        (scale::shift_degrees(base, deg, tonic, sc) - base) as f32
-    };
+    let interval = |plan: &[i32], i: usize| (plan[i] - scale::nearest(notes[i].midi, tonic, sc)) as f32;
     let mut env = vec![0.0f32; frames];
     for n in notes {
         let (a, b) = ((n.start * fs).max(0.0) as usize, ((n.end * fs) as usize).min(frames));
@@ -168,6 +215,7 @@ fn spectral_harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, voices: &[i
     let mut out = vec![0.0f32; frames * 2];
     let n_voices = voices.len();
     for (k, deg) in voices.iter().enumerate() {
+        let voice = plan(notes, *deg, tonic, sc, chords);
         let pan = if n_voices == 1 { 0.0 } else { -0.6 + 1.2 * k as f32 / (n_voices - 1) as f32 };
         let (gl, gr) = ((0.5 - 0.5 * pan).sqrt(), (0.5 + 0.5 * pan).sqrt());
         let mut st = Stretch::preset_default(1, sr);
@@ -183,8 +231,8 @@ fn spectral_harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, voices: &[i
             // The interval of the note this block belongs to; between notes
             // keep the last one (it is silent there anyway).
             let t = (i + n / 2) as f32 / fs;
-            let semis = note_at(notes, t, 0.0).map(|note| interval(note, *deg)).unwrap_or(current);
-            let semis = if semis.is_nan() { notes.first().map(|n0| interval(n0, *deg)).unwrap_or(0.0) } else { semis };
+            let semis = note_index(notes, t).map(|i| interval(&voice, i)).unwrap_or(current);
+            let semis = if semis.is_nan() { interval(&voice, 0) } else { semis };
             if semis != current {
                 st.set_transpose_factor_semitones(semis, Some(TONALITY_LIMIT_HZ / fs));
                 current = semis;
@@ -199,6 +247,47 @@ fn spectral_harmony(vocal: &[f32], sr: u32, tonic: i32, minor: bool, voices: &[i
             let y = shifted[f + latency] * env[f];
             out[2 * f] += y * gl;
             out[2 * f + 1] += y * gr;
+        }
+    }
+    out
+}
+
+// ------------------------------------------------------- studio polish --
+
+/// The harmony mixed like recorded backing vocals, so it sits behind the
+/// lead instead of on top of it: no low end (that's the lead's and the
+/// bass's), less presence and air, the "s" sounds tamed (`voice`: the
+/// singer's own, shifted), a few milliseconds late, and in a room (a
+/// reverb, which also spreads it across the stereo field). Interleaved
+/// stereo at `sr`, the same length.
+pub fn polish(buf: &[f32], sr: u32, voice: bool) -> Vec<f32> {
+    let fs = sr as f32;
+    let frames = buf.len() / 2;
+    let mut eq = [[Biquad::default(); 3]; 2];
+    for ch in eq.iter_mut() {
+        ch[0].set(Shape::HighPass, 200.0, 0.707, fs);
+        ch[1].set(Shape::Peak(-2.5), 3000.0, 0.9, fs);
+        ch[2].set(Shape::HighShelf(-3.0), 7000.0, 0.707, fs);
+    }
+    let mut deess = [DeEsser::new(fs), DeEsser::new(fs)];
+    let mut room = Reverb::new(fs);
+    // Behind the lead: 12 ms late (well under an echo).
+    let late = (0.012 * fs) as usize;
+    let mut out = vec![0.0f32; buf.len()];
+    for f in 0..frames {
+        let mut x = [buf[2 * f], buf[2 * f + 1]];
+        for (ch, v) in x.iter_mut().enumerate() {
+            for b in eq[ch].iter_mut() {
+                *v = b.run(*v);
+            }
+            if voice {
+                *v = deess[ch].run(*v, 0.7);
+            }
+        }
+        let (wl, wr) = room.run(x[0], x[1], 0.62, 0.5);
+        if let Some(o) = out.get_mut(2 * (f + late)..2 * (f + late) + 2) {
+            o[0] = 0.85 * x[0] + 0.55 * wl;
+            o[1] = 0.85 * x[1] + 0.55 * wr;
         }
     }
     out
@@ -252,7 +341,7 @@ fn hz(midi: f32) -> f32 {
 /// above), in the key `tonic` major or minor. Nothing of the original vocal
 /// goes in, so nothing of its reverb or bleed can crack. `frames` long,
 /// interleaved stereo at `sr`. Silent without notes.
-pub fn choir(frames: usize, sr: u32, tonic: i32, minor: bool, degrees: &[i32], notes: &[Note]) -> Vec<f32> {
+pub fn choir(frames: usize, sr: u32, tonic: i32, minor: bool, degrees: &[i32], notes: &[Note], chords: &[Chord]) -> Vec<f32> {
     let fs = sr as f32;
     let sc = scale::scale(if minor { MINOR } else { MAJOR });
     let voices: Vec<i32> = degrees.iter().copied().filter(|d| *d != 0).take(MAX_VOICES).collect();
@@ -263,11 +352,13 @@ pub fn choir(frames: usize, sr: u32, tonic: i32, minor: bool, degrees: &[i32], n
     let level = 0.16 / ((voices.len() * ENSEMBLE.len()) as f32).sqrt();
     for deg in voices.iter() {
         // The harmony note for each sung note, and its wavetable.
+        let voice = plan(notes, *deg, tonic, sc, chords);
         let parts: Vec<(f32, f32, f32, Vec<f32>)> = notes
             .iter()
-            .map(|n| {
+            .zip(&voice)
+            .map(|(n, harm)| {
                 let base = scale::nearest(n.midi, tonic, sc);
-                let m = scale::shift_degrees(base, *deg, tonic, sc) as f32 + (n.midi - base as f32) * 0.3;
+                let m = *harm as f32 + (n.midi - base as f32) * 0.3;
                 (n.start, n.end, hz(m), ooh_table(hz(m)))
             })
             .collect();
@@ -350,7 +441,7 @@ mod tests {
                 [s, s]
             })
             .collect();
-        let out = harmony(&tone, sr, 0, false, &[2], &[]);
+        let out = harmony(&tone, sr, 0, false, &[2], &[], &[]);
         assert_eq!(out.len(), tone.len());
         // Estimate the output pitch in the steady middle part.
         let mono: Vec<f32> = out.chunks(2).map(|c| c[0] + c[1]).collect();
@@ -380,7 +471,7 @@ mod tests {
             })
             .collect();
         let notes = [Note { start: 0.3, end: 0.7, midi: 69.0 }];
-        let out = harmony(&tone, sr, 0, false, &[2], &notes);
+        let out = harmony(&tone, sr, 0, false, &[2], &notes, &[]);
         let energy = |a: f32, b: f32| -> f32 {
             let (a, b) = ((a * sr as f32) as usize, (b * sr as f32) as usize);
             out[2 * a..2 * b].iter().map(|x| x * x).sum::<f32>() / (b - a) as f32
@@ -402,7 +493,7 @@ mod tests {
                 [s, s]
             })
             .collect();
-        let out = harmony(&tone, sr, 0, false, &[2], &[Note { start: 0.0, end: 1.0, midi: 69.0 }]);
+        let out = harmony(&tone, sr, 0, false, &[2], &[Note { start: 0.0, end: 1.0, midi: 69.0 }], &[]);
         let mono: Vec<f32> = out.chunks(2).map(|c| c[0] + c[1]).collect();
         let mut det = PitchDetector::new(sr as f32);
         let mut freqs = Vec::new();
@@ -422,7 +513,7 @@ mod tests {
     fn choir_sings_a_third_above_inside_the_notes() {
         let sr = 44_100u32;
         let n = sr as usize;
-        let out = choir(n, sr, 0, false, &[2], &[Note { start: 0.2, end: 0.8, midi: 69.0 }]);
+        let out = choir(n, sr, 0, false, &[2], &[Note { start: 0.2, end: 0.8, midi: 69.0 }], &[]);
         let mono: Vec<f32> = out.chunks(2).map(|c| c[0] + c[1]).collect();
         let mut det = PitchDetector::new(sr as f32);
         let mut freqs = Vec::new();
@@ -441,10 +532,54 @@ mod tests {
         assert!(mono.iter().all(|x| x.abs() < 1.0), "no clipping");
     }
 
+    /// C major, melody E: a third above is G (the scale's); over an E major
+    /// chord it is G# (the chord's). A held chord note stays.
+    #[test]
+    fn harmony_follows_the_chord() {
+        let sc = scale::scale(MAJOR);
+        let e = |start: f32| Note { start, end: start + 0.4, midi: 64.0 };
+        assert_eq!(plan(&[e(0.0)], 2, 0, sc, &[]), vec![67]);
+        let e_major = [Chord { start: 0.0, end: 2.0, root: 4, minor: false }];
+        assert_eq!(plan(&[e(0.0)], 2, 0, sc, &e_major), vec![68]);
+        // Over C major, melody E then D: G, then G again (held), not F.
+        let c = [Chord { start: 0.0, end: 2.0, root: 0, minor: false }];
+        let d = Note { start: 0.5, end: 0.9, midi: 62.0 };
+        assert_eq!(plan(&[e(0.0), d], 2, 0, sc, &c), vec![67, 67]);
+        // Below: melody G over C major, a third below is E.
+        assert_eq!(plan(&[Note { start: 0.0, end: 0.4, midi: 67.0 }], -2, 0, sc, &c), vec![64]);
+        // An octave is an octave, whatever the chord.
+        assert_eq!(plan(&[e(0.0)], 7, 0, sc, &e_major), vec![76]);
+    }
+
+    /// The polish keeps the length, takes out the low end, and leaves a
+    /// tail after a sound stops (the room).
+    #[test]
+    fn polish_cuts_lows_and_adds_a_room() {
+        let sr = 44_100u32;
+        let n = sr as usize;
+        let tone = |f: f32| -> Vec<f32> {
+            (0..n).flat_map(|i| {
+                let t = i as f32 / sr as f32;
+                let s = if t < 0.5 { 0.3 * (std::f32::consts::TAU * f * t).sin() } else { 0.0 };
+                [s, s]
+            }).collect()
+        };
+        let rms = |b: &[f32], a: f32, z: f32| {
+            let (a, z) = ((a * sr as f32) as usize * 2, (z * sr as f32) as usize * 2);
+            (b[a..z].iter().map(|x| x * x).sum::<f32>() / (z - a) as f32).sqrt()
+        };
+        let low = polish(&tone(60.0), sr, false);
+        let mid = polish(&tone(500.0), sr, true);
+        assert_eq!(mid.len(), n * 2);
+        assert!(rms(&low, 0.2, 0.45) < 0.35 * rms(&mid, 0.2, 0.45), "low {} mid {}", rms(&low, 0.2, 0.45), rms(&mid, 0.2, 0.45));
+        assert!(rms(&mid, 0.6, 0.8) > 1e-3, "no tail: {}", rms(&mid, 0.6, 0.8));
+        assert!(mid.iter().all(|x| x.abs() < 1.0));
+    }
+
     #[test]
     fn nothing_to_harmonise_is_silence() {
-        let out = harmony(&vec![0.0; 44_100 * 2], 44_100, 0, false, &[2], &[]);
+        let out = harmony(&vec![0.0; 44_100 * 2], 44_100, 0, false, &[2], &[], &[]);
         assert!(out.iter().all(|x| x.abs() < 1e-6));
-        assert!(harmony(&vec![0.1; 200], 44_100, 0, false, &[], &[]).iter().all(|x| *x == 0.0));
+        assert!(harmony(&vec![0.1; 200], 44_100, 0, false, &[], &[], &[]).iter().all(|x| *x == 0.0));
     }
 }

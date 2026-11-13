@@ -161,3 +161,104 @@ export function toSingers(lines: Line[], who: (Singer | undefined)[], offset: nu
   });
   return out;
 }
+
+/** Why a line was picked for the harmony (shown to the user). */
+export interface HarmonySuggestion {
+  lines: Set<number>;
+  chorus: number;
+  climax: number;
+  held: number;
+}
+
+/** A line's words, compared loosely (case, punctuation and spacing aside). */
+const wordsOf = (l: Line) =>
+  l.words
+    .map((w) => w.text.toLowerCase().replace(/[^\p{L}\p{N}]/gu, ""))
+    .filter(Boolean);
+
+/** Share of `a`'s words also in `b` (both ways, the smaller). */
+function overlap(a: string[], b: string[]): number {
+  if (!a.length || !b.length) return 0;
+  const count = (x: string[], y: string[]) => {
+    const pool = new Map<string, number>();
+    y.forEach((w) => pool.set(w, (pool.get(w) ?? 0) + 1));
+    let n = 0;
+    for (const w of x) {
+      const c = pool.get(w) ?? 0;
+      if (c > 0) {
+        n++;
+        pool.set(w, c - 1);
+      }
+    }
+    return n;
+  };
+  return Math.min(count(a, b) / a.length, count(b, a) / b.length);
+}
+
+/**
+ * Where a harmony belongs, as an arranger would put it: the chorus (lines
+ * sung again and again), the climaxes (where the music is clearly louder
+ * than usual) and long held notes at the end of a strong line; not rap
+ * (many words to the second) nor stand-in hums. `energy` is the music's
+ * loudness every `step` seconds of the recording; `offset` turns lyric time
+ * into recording time.
+ */
+export function suggestHarmony(lines: Line[], energy: number[] | null | undefined, step: number, offset: number): HarmonySuggestion {
+  const words = lines.map(wordsOf);
+  const rap = lines.map((l) => {
+    const dur = Math.max(0.5, l.end - l.start);
+    return l.words.length / dur > 4.2;
+  });
+  // How often each line is sung (itself and its near-twins).
+  const times = lines.map((_, i) => (words[i].length < 2 ? 1 : 1 + lines.filter((_, j) => j !== i && overlap(words[i], words[j]) >= 0.75).length));
+  const repeated = times.map((n) => n >= 2);
+  // The chorus is what comes back most: three times or more (a pre-chorus
+  // usually comes twice); in a song with two choruses, twice.
+  const most = Math.max(1, ...times);
+  const chorusTimes = most >= 3 ? 3 : 2;
+  const counted = times.map((n) => n >= chorusTimes && most >= 2);
+  // A line sung a little differently inside a chorus is still the chorus.
+  const chorus = counted.map((c, i) => c || (!!counted[i - 1] && !!counted[i + 1]));
+  // Climax: the line's music is clearly louder than the song's middle.
+  const loud = (() => {
+    if (!energy?.length) return lines.map(() => false);
+    const sorted = [...energy].sort((a, b) => a - b);
+    const median = sorted[Math.floor(sorted.length / 2)] || 1e-6;
+    const top = sorted[Math.floor(sorted.length * 0.8)] || median;
+    const bar = Math.max(median * 1.25, top * 0.95);
+    return lines.map((l) => {
+      const a = Math.max(0, Math.floor((l.start + offset) / step));
+      const b = Math.min(energy.length, Math.ceil((l.end + offset) / step));
+      if (b <= a) return false;
+      let sum = 0;
+      for (let k = a; k < b; k++) sum += energy[k];
+      return sum / (b - a) >= bar;
+    });
+  })();
+  // A long note to end a line, in a loud stretch: a harmony makes it bloom.
+  const held = lines.map((l) => {
+    const last = l.words[l.words.length - 1];
+    return !!last && last.end - last.start >= 1.2;
+  });
+  const picked = new Set<number>();
+  let nChorus = 0;
+  let nClimax = 0;
+  let nHeld = 0;
+  lines.forEach((l, i) => {
+    if (l.hum || rap[i]) return;
+    if (chorus[i]) {
+      picked.add(i);
+      nChorus++;
+    } else if (loud[i] && (repeated[i] || held[i])) {
+      // A pre-chorus or held note, where the music swells.
+      picked.add(i);
+      nClimax++;
+    } else if (held[i] && loud[i - 1] && loud[i + 1]) {
+      picked.add(i);
+      nHeld++;
+    }
+  });
+  // Nothing found (no repeats, flat loudness): the loudest fifth of the lines.
+  if (!picked.size && energy?.length) lines.forEach((l, i) => !l.hum && !rap[i] && loud[i] && picked.add(i));
+  return { lines: picked, chorus: nChorus, climax: nClimax, held: nHeld };
+}

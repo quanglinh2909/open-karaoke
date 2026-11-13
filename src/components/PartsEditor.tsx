@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "../lib/api";
-import { setParts, songParts } from "../lib/loader";
+import { setParts, songParts, suggestBacking } from "../lib/loader";
 import { formatTime } from "../lib/music";
 import { applyAdjust, fromParts, leadParts, lineSingers, segKey, SINGER_LABEL, span, toSegments, toSingers, type Adjust, type LapMode, type Laps, type Segment, type Singer } from "../lib/parts";
 import { useStore } from "../lib/store";
@@ -124,7 +124,10 @@ export function PartsEditor() {
 
   const save = () => {
     const p = current();
-    void setParts({ original: p.original, backing: p.backing, adjust: { original: adj.original, backing: adj.backing }, laps, singers: toSingers(lines, who, offset) }, p.lead);
+    // Harmony lines cleared by hand: the harmony is meant for the whole song, don't place it again.
+    const prev = songParts(song.meta.id);
+    const autoBacking = !harm.size && prev.backing.length ? false : prev.autoBacking;
+    void setParts({ original: p.original, backing: p.backing, adjust: { original: adj.original, backing: adj.backing }, laps, singers: toSingers(lines, who, offset), autoBacking }, p.lead);
     close(true);
   };
 
@@ -256,6 +259,23 @@ export function PartsEditor() {
           </div>
         </div>
         <div className="le-foot">
+          <button
+            className="btn small"
+            disabled={!lines.length}
+            title="Chọn dòng có bè như người phối khí: điệp khúc (câu lặp lại nhiều nhất), đoạn nhạc lên cao trào, nốt ngân dài; bỏ qua rap"
+            onClick={() => {
+              const sg = suggestBacking();
+              if (!sg?.lines.size) {
+                useStore.getState().toast("Không tìm được điệp khúc hay cao trào rõ ràng cho bài này.", "info");
+                return;
+              }
+              setHarm(new Set(sg.lines));
+              const why = [sg.chorus && `${sg.chorus} dòng điệp khúc`, sg.climax && `${sg.climax} dòng cao trào`, sg.held && `${sg.held} nốt ngân`].filter(Boolean).join(", ");
+              useStore.getState().toast(`Đã chọn bè cho ${sg.lines.size} dòng (${why}). Xem lại rồi bấm Lưu.`, "success");
+            }}
+          >
+            ✨ Tự chọn đoạn bè
+          </button>
           <button
             className="btn small"
             onClick={() => {

@@ -47,6 +47,8 @@ export class FramePool {
   private done = new Map<number, Band>();
   private waiting = new Map<number, (d: Band | null) => void>();
   private broken = false;
+  private onChunk: ((data: ArrayBuffer, frames: number) => void) | null = null;
+  private onRecorded: (() => void) | null = null;
 
   private constructor(
     private workers: Worker[],
@@ -63,7 +65,9 @@ export class FramePool {
             this.waiting.delete(m.i);
             wake(band);
           } else this.done.set(m.i, band);
-        } else if (m.type === "error") this.fail();
+        } else if (m.type === "chunk") this.onChunk?.(m.data, m.frames);
+        else if (m.type === "recorded") this.onRecorded?.();
+        else if (m.type === "error") this.fail();
       };
       w.onerror = () => this.fail();
     }
@@ -125,6 +129,57 @@ export class FramePool {
       return Promise.resolve(have);
     }
     return new Promise((resolve) => this.waiting.set(i, resolve));
+  }
+
+  /**
+   * Every frame recorded as canvas calls (for the backend to draw), each
+   * worker a stretch of them; `chunk` gets the recordings as they come (in
+   * no particular order) and is awaited one at a time. Rejects if a worker fails.
+   */
+  async record(chunk: (data: ArrayBuffer, frames: number) => Promise<void>): Promise<void> {
+    const n = this.workers.length;
+    const per = Math.ceil(this.total / n);
+    let pending = Promise.resolve();
+    let left = 0;
+    let failed: unknown = null;
+    await new Promise<void>((resolve, reject) => {
+      const check = () => {
+        if (failed) reject(failed);
+        else if (left === 0) void pending.then(resolve, reject);
+      };
+      this.onChunk = (data, frames) => {
+        pending = pending.then(() => chunk(data, frames)).catch((e) => {
+          failed = e;
+          check();
+        });
+      };
+      this.onRecorded = () => {
+        left--;
+        check();
+      };
+      const fail = this.fail.bind(this);
+      this.fail = () => {
+        fail();
+        failed ??= new Error("Bộ vẽ chữ bị lỗi");
+        check();
+      };
+      this.workers.forEach((w, k) => {
+        const from = k * per;
+        const to = Math.min(this.total, from + per);
+        if (to <= from) return;
+        left++;
+        const times = new Float64Array(to - from);
+        for (let i = from; i < to; i++) times[i - from] = this.time(i);
+        w.postMessage({ type: "record", from, times });
+      });
+      if (left === 0) resolve();
+    });
+  }
+
+  /** The frames' times and count, when only known after starting the workers. */
+  retime(time: (i: number) => number, total: number) {
+    this.time = time;
+    this.total = total;
   }
 
   close() {

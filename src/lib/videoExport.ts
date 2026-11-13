@@ -1,16 +1,23 @@
 import { convertFileSrc, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { FAST_FAMILY } from "./canvasRecorder";
 import { Muxer, StreamTarget } from "mp4-muxer";
 import { AMBIENT_PERIOD, paintAmbient } from "./ambient";
 import { songSingers } from "./loader";
 import { FramePool } from "./framePool";
-import { drawer, drawShade, lyricBand, type LyricStyle } from "./lyricDraw";
+import { drawer, drawShade, lyricBand, stillYuv, type LyricStyle } from "./lyricDraw";
+import { exportPrefs } from "./exportPrefs";
 import { useStore } from "./store";
 import { VideoFrames } from "./videoFrames";
 
 export type Orientation = "landscape" | "portrait";
 export type { LyricStyle } from "./lyricDraw";
 
-const FPS = 30;
+/** Frames per second of the export being made (30, or 25 to export faster). */
+let FPS = 30;
+
+/** The frame rates offered: 30 is smoother, 25 makes a sixth fewer frames. */
+export type FrameRate = 30 | 25;
 
 const SIZES: Record<Orientation, [number, number]> = {
   landscape: [1280, 720],
@@ -35,7 +42,9 @@ export async function exportKaraokeVideo(
   backdrop: Backdrop,
   onProgress: (f: number) => void,
   cancelled: () => boolean,
+  fps: FrameRate = 30,
 ): Promise<string> {
+  FPS = fps;
   const song = useStore.getState().song;
   if (!song?.info) throw new Error("Chưa mở bài hát nào");
   const lines = song.lyrics.lines ?? [];
@@ -80,7 +89,7 @@ export async function exportKaraokeVideo(
   // Written to disk as the muxer produces it, 8 MB at a time and in order:
   // a Full HD export runs to hundreds of MB, too much to hold and hand over
   // in one call. The `.part` file is renamed when done, dropped on failure.
-  const name = `${song.meta.artist} - ${song.meta.title} (karaoke)`;
+  const name = exportName();
   const part = await invoke<string>("video_begin", { name });
   let writes: Promise<unknown> = Promise.resolve();
   let writeError: unknown = null;
@@ -147,7 +156,7 @@ export async function exportKaraokeVideo(
     // ---- video
     const canvas = new OffscreenCanvas(W, H);
     const ctx = canvas.getContext("2d")!;
-    const bg = await background(backdrop === "artwork" ? song.meta.artwork : null, W, H);
+    const bg = await stillBackground(backdrop, song.meta.artwork, W, H);
     const css = getComputedStyle(document.documentElement);
     const font = css.getPropertyValue("--font-display").trim() || "sans-serif";
     const accent = css.getPropertyValue("--accent").trim() || "#ff3d7f";
@@ -163,6 +172,7 @@ export async function exportKaraokeVideo(
       song.meta.artist,
       style,
       songSingers(),
+      singingAids(),
     );
 
     const venc = new VideoEncoder({
@@ -225,8 +235,62 @@ export async function exportKaraokeVideo(
   }
 }
 
+/** Key names for file names (ASCII: no ♯/♭). */
+const FILE_NOTES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"];
+
+/**
+ * The exported video's file name: the song's name (as the user corrected it)
+ * and the key it is sung in, e.g. "Bùi Công Nam - Anh Không Theo Đuổi Em Nữa
+ * (Karaoke - Tone G, hạ 2 nửa cung)", or "… (Karaoke - Tone gốc A)"; a changed
+ * tempo is added too.
+ */
+export function exportName(): string {
+  const song = useStore.getState().song;
+  if (!song) return "Karaoke";
+  const semis = song.info?.semitones ?? 0;
+  const key = song.info?.key;
+  const keyText = (shift: number) =>
+    key ? `${FILE_NOTES[(((key.tonic + shift) % 12) + 12) % 12]}${key.minor ? "m" : ""}` : "";
+  const parts = [
+    semis === 0
+      ? `Tone gốc${key ? ` ${keyText(0)}` : ""}`
+      : `Tone ${keyText(semis) || ""}${key ? ", " : ""}${semis < 0 ? "hạ" : "nâng"} ${Math.abs(semis)} nửa cung`.replace("Tone , ", "Tone "),
+  ];
+  const tempo = song.info?.tempo ?? 1;
+  if (Math.abs(tempo - 1) > 0.001) parts.push(`${tempo > 1 ? "nhanh" : "chậm"} ${Math.round(tempo * 100)}%`);
+  const who = song.meta.artist ? `${song.meta.artist} - ` : "";
+  return `${who}${song.meta.title} (Karaoke - ${parts.join(", ")})`;
+}
+
 /** Where the export's picture comes from: the recording's video, the song's artwork, or the app's plain dark background. */
-export type Backdrop = "video" | "artwork" | "plain";
+export type Backdrop = "video" | "artwork" | "plain" | "image";
+
+/** This song's own background picture, if one was chosen. */
+export function exportImage(): string | null {
+  return exportPrefs(useStore.getState().song?.meta.id).image ?? null;
+}
+
+/** The background for `backdrop` other than the video: the user's picture, the blurred artwork, or the plain gradient. */
+async function stillBackground(backdrop: Backdrop, artwork: string | null, W: number, H: number): Promise<OffscreenCanvas> {
+  if (backdrop === "image") {
+    const path = exportImage();
+    if (!path) throw new Error("Chưa chọn hình nền: bấm \"Chọn hình\" ở mục Xuất video");
+    return background(convertFileSrc(path), W, H, "picture");
+  }
+  return background(backdrop === "artwork" ? artwork : null, W, H);
+}
+
+/** The singing aids for the open song, as the drawer takes them (beats in lyric time). */
+function singingAids() {
+  const { song, aids } = useStore.getState();
+  const offset = song?.userOffset ?? 0;
+  return {
+    notes: aids.pitch ? (song?.melody ?? null) : null,
+    look: aids.look,
+    offset,
+    beats: aids.beat && song?.beats ? song.beats.times.map((b) => b - offset) : null,
+  };
+}
 
 /** The recording's picture-only video, downloaded first if needed. */
 async function recordingVideo(): Promise<string> {
@@ -262,12 +326,12 @@ async function exportWithFfmpeg(
   const tempo = song.info.tempo || 1;
   const offset = song.userOffset;
   const trim = song.trim ?? { start: 0, end: 0 };
-  const name = `${song.meta.artist} - ${song.meta.title} (karaoke)`;
+  const name = exportName();
   const part = await invoke<string>("video_begin", { name });
   const png = async (c: OffscreenCanvas) => new Uint8Array(await (await c.convertToBlob({ type: "image/png" })).arrayBuffer());
   try {
     // The still layer: the whole picture, or the shade over the video.
-    const bg = await background(backdrop === "artwork" ? song.meta.artwork : null, W, H);
+    const bg = await stillBackground(backdrop, song.meta.artwork, W, H);
     let still = bg;
     const ambient = !videoPath && backdrop === "plain";
     if (videoPath) {
@@ -305,9 +369,20 @@ async function exportWithFfmpeg(
       }
       if (size) await flush();
     }
-    await invoke("video_ffmpeg_backdrop", await png(still), {
-      headers: { "x-path": encodeURIComponent(part) },
-    });
+    if (!videoPath && !ambient) {
+      // A still picture: sent once in the video's own format; the lyrics are
+      // laid on it in the backend and ffmpeg only encodes (much faster).
+      await invoke("video_ffmpeg_backdrop", stillYuv(bg), {
+        headers: { "x-path": encodeURIComponent(part), "x-format": "yuv420p" },
+      });
+      // Fastest: the backend draws the lyrics too, from recorded canvas calls.
+      const fast = await exportFast(part, W, H, style, onProgress, cancelled);
+      if (fast) return fast;
+    } else {
+      await invoke("video_ffmpeg_backdrop", await png(still), {
+        headers: { "x-path": encodeURIComponent(part) },
+      });
+    }
     const sound = await invoke<{ sampleRate: number; first: number; frames: number; hardware: boolean }>("video_ffmpeg_begin", {
       path: part,
       width: W,
@@ -330,7 +405,8 @@ async function exportWithFfmpeg(
     const font = css.getPropertyValue("--font-display").trim() || "sans-serif";
     const accent = css.getPropertyValue("--accent").trim() || "#ff3d7f";
     const singers = songSingers();
-    const draw = drawer(ctx, W, H, bg, font, accent, lines, song.meta.title, song.meta.artist, style, singers);
+    const aids = singingAids();
+    const draw = drawer(ctx, W, H, bg, font, accent, lines, song.meta.title, song.meta.artist, style, singers, aids);
     const timeOf = (i: number) => (skip + i / FPS) * tempo - offset;
     // Frames drawn by several workers at once (the same drawing code and
     // fonts, checked), sent to ffmpeg in order; on the page if they can't.
@@ -339,7 +415,7 @@ async function exportWithFfmpeg(
     const pool = await FramePool.start(
       // With x264 on the CPU too, fewer workers: they would only take turns.
       Math.min(sound.hardware ? 8 : 5, Math.max(0, (navigator.hardwareConcurrency || 4) - (sound.hardware ? 2 : 6))),
-      { W, H, font, accent, lines, title: song.meta.title, artist: song.meta.artist, style, singers },
+      { W, H, font, accent, lines, title: song.meta.title, artist: song.meta.artist, style, singers, aids },
       { ...probe, width: ctx.measureText(probe.text).width },
       timeOf,
       total,
@@ -370,6 +446,93 @@ async function exportWithFfmpeg(
   } catch (e) {
     void invoke("video_ffmpeg_abort", { path: part });
     throw e;
+  }
+}
+
+/**
+ * The lyric video over a still picture, drawn and encoded by the backend
+ * (`fastvideo`): workers run the same drawer on a recorder (canvas calls,
+ * no pixels), which the backend replays on every core while x264 encodes
+ * only the rows the lyrics move in. Null when it can't (no workers, or a
+ * font the backend doesn't have): the caller exports the usual way.
+ */
+async function exportFast(
+  part: string,
+  W: number,
+  H: number,
+  style: LyricStyle,
+  onProgress: (f: number) => void,
+  cancelled: () => boolean,
+): Promise<string | null> {
+  const song = useStore.getState().song;
+  if (!song?.info) return null;
+  const css = getComputedStyle(document.documentElement);
+  const font = css.getPropertyValue("--font-display").trim() || "sans-serif";
+  if (!font.includes(FAST_FAMILY)) return null;
+  const accent = css.getPropertyValue("--accent").trim() || "#ff3d7f";
+  const lines = song.lyrics.lines ?? [];
+  const tempo = song.info.tempo || 1;
+  const offset = song.userOffset;
+  const trim = song.trim ?? { start: 0, end: 0 };
+  const started = performance.now();
+  // The workers start (loading fonts) while the backend prepares the sound.
+  const probe = { font: `700 64px ${font}`, text: "Đây sẽ là lý do em ’ // ‿ Hey" };
+  const measure = new OffscreenCanvas(1, 1).getContext("2d")!;
+  measure.font = probe.font;
+  const [sound, pool] = await Promise.all([
+    invoke<{ sampleRate: number; first: number; frames: number }>("video_fast_begin", {
+      path: part,
+      width: W,
+      height: H,
+      fps: FPS,
+      trimStart: trim.start / tempo,
+      trimEnd: trim.end / tempo,
+    }),
+    FramePool.start(
+      Math.min(8, Math.max(2, (navigator.hardwareConcurrency || 4) - 1)),
+      { W, H, font, accent, lines, title: song.meta.title, artist: song.meta.artist, style, singers: songSingers(), aids: singingAids() },
+      { ...probe, width: measure.measureText(probe.text).width },
+      () => 0,
+      0,
+    ),
+  ]);
+  const ready = performance.now();
+  if (!pool) {
+    await invoke("video_fast_abort", { path: part }).catch(() => undefined);
+    return null;
+  }
+  const skip = sound.first / sound.sampleRate;
+  const total = Math.ceil((sound.frames / sound.sampleRate) * FPS);
+  pool.retime((i) => (skip + i / FPS) * tempo - offset, total);
+  const unlisten = await listen<number>("export://fast", (e) => onProgress(0.2 + 0.79 * e.payload));
+  try {
+    let recorded = 0;
+    await pool.record(async (data, frames) => {
+      if (cancelled()) throw new Error("cancelled");
+      await invoke("video_fast_chunk", new Uint8Array(data), { headers: { "x-path": encodeURIComponent(part) } });
+      recorded += frames;
+      onProgress(0.03 + 0.17 * (recorded / total));
+    });
+    const drawn = performance.now();
+    if (cancelled()) throw new Error("cancelled");
+    const watch = setInterval(() => {
+      if (cancelled()) void invoke("video_fast_abort", { path: part });
+    }, 200);
+    try {
+      const out = await invoke<string>("video_fast_finish", { path: part, frames: total });
+      void invoke("dev_log", {
+        text: `export: ${total} frames in ${((performance.now() - started) / 1000).toFixed(1)} s, fast (workers ready ${((ready - started) / 1000).toFixed(1)} s, recorded ${((drawn - ready) / 1000).toFixed(1)} s, drawn and encoded ${((performance.now() - drawn) / 1000).toFixed(1)} s)`,
+      }).catch(() => undefined);
+      return out;
+    } finally {
+      clearInterval(watch);
+    }
+  } catch (e) {
+    await invoke("video_fast_abort", { path: part }).catch(() => undefined);
+    throw e;
+  } finally {
+    unlisten();
+    pool.close();
   }
 }
 
@@ -415,6 +578,8 @@ async function background(
   artwork: string | null,
   W: number,
   H: number,
+  /** "picture": the user's own image, shown as it is (only darkened under the lyrics). */
+  look: "blurred" | "picture" = "blurred",
 ): Promise<OffscreenCanvas> {
   const c = new OffscreenCanvas(W, H);
   const g = c.getContext("2d")!;
@@ -427,6 +592,18 @@ async function background(
   try {
     const blob = await (await fetch(artwork)).blob();
     const img = await createImageBitmap(blob);
+    if (look === "picture") {
+      // Fills the frame (cropped to fit), sharp; a soft shade where the lyrics go.
+      const s = Math.max(W / img.width, H / img.height);
+      g.drawImage(img, (W - img.width * s) / 2, (H - img.height * s) / 2, img.width * s, img.height * s);
+      const shade = g.createLinearGradient(0, 0, 0, H);
+      shade.addColorStop(0, "rgba(8, 6, 12, 0.15)");
+      shade.addColorStop(0.45, "rgba(8, 6, 12, 0.3)");
+      shade.addColorStop(1, "rgba(8, 6, 12, 0.6)");
+      g.fillStyle = shade;
+      g.fillRect(0, 0, W, H);
+      return c;
+    }
     const s = Math.max(W / img.width, H / img.height) * 1.15;
     g.filter = "blur(36px) brightness(0.38) saturate(1.2)";
     g.drawImage(
@@ -437,7 +614,8 @@ async function background(
       img.height * s,
     );
     g.filter = "none";
-  } catch {
+  } catch (e) {
+    if (look === "picture") throw new Error(`Không mở được hình nền: ${e instanceof Error ? e.message : String(e)}`);
     // Artwork unavailable (offline or blocked): keep the gradient.
   }
   return c;

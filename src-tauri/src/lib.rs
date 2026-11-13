@@ -1,4 +1,5 @@
 pub mod audio;
+mod fastvideo;
 mod meta;
 mod tools;
 mod youtube;
@@ -71,6 +72,12 @@ struct AppState {
     dirs: Dirs,
     /// ffmpeg encoding an exported video (Linux: WebKitGTK's WebCodecs crash).
     encoder: Mutex<Option<std::process::Child>>,
+    /// The export's still background as yuv420p, when the lyrics are laid on
+    /// it here (a still picture: ffmpeg then only encodes).
+    encoder_still: Mutex<Option<Vec<u8>>>,
+    /// The fast export of a lyric video over a still picture, while recorded.
+    fast: Mutex<Option<FastExport>>,
+    fast_cancel: Arc<std::sync::atomic::AtomicBool>,
     song: Mutex<Song>,
     /// Bumped whenever the loaded audio changes; stale background work is dropped.
     generation: Arc<AtomicU32>,
@@ -965,6 +972,51 @@ async fn melody_notes(app: AppHandle, state: State<'_, AppState>, source: String
     Ok(notes)
 }
 
+/// The beat of a recording (its separated instrumental): tempo and beat
+/// times, for countdowns on the beat. Kept on disk, so each recording is
+/// analysed once (a second or two).
+#[tauri::command]
+async fn song_beats(state: State<'_, AppState>, source: String) -> Res<audio::beats::Beats> {
+    let (inst, _) = stem_paths(&state.dirs.stems, &source)?;
+    let file = state.dirs.stems.join(format!("{source}.beats.json"));
+    // (Files saved before the loudness was added are made again.)
+    if let Some(b) = std::fs::read(&file).ok().and_then(|b| serde_json::from_slice::<audio::beats::Beats>(&b).ok()).filter(|b| !b.energy.is_empty()) {
+        return Ok(b);
+    }
+    if !inst.is_file() {
+        return Err("Chưa có nhạc nền đã tách".into());
+    }
+    let beats = blocking(move || -> Res<_> {
+        const SR: u32 = 22_050;
+        let stereo = audio::decode::decode_file(&inst, SR)?;
+        let mono: Vec<f32> = stereo.chunks(2).map(|c| 0.5 * (c[0] + c.get(1).copied().unwrap_or(c[0]))).collect();
+        Ok(audio::beats::track(&mono, SR))
+    })
+    .await??;
+    let _ = std::fs::write(&file, serde_json::to_vec(&beats).unwrap_or_default());
+    Ok(beats)
+}
+
+/// The chords of the open song's instrumental, for the harmony to sing
+/// chord notes. Kept on disk next to the stems (about a second the first time).
+async fn song_chords(state: &AppState) -> Vec<audio::chords::Chord> {
+    let (inst, sr, key, source) = {
+        let s = state.song.lock().unwrap();
+        (s.inst.clone(), s.sr, s.key.clone(), s.source_id.clone())
+    };
+    let file = source.as_ref().map(|id| state.dirs.stems.join(format!("{id}.chords.json")));
+    if let Some(c) = file.as_ref().and_then(|f| std::fs::read(f).ok()).and_then(|b| serde_json::from_slice(&b).ok()) {
+        return c;
+    }
+    let Some(inst) = inst else { return Vec::new() };
+    let key = key.map(|k| (k.tonic, k.minor));
+    let chords = blocking(move || audio::chords::detect(&inst, 2, sr, key)).await.unwrap_or_default();
+    if let Some(f) = file.filter(|_| !chords.is_empty()) {
+        let _ = std::fs::write(f, serde_json::to_vec(&chords).unwrap_or_default());
+    }
+    chords
+}
+
 #[tauri::command]
 async fn transcribe_vocal(
     app: AppHandle,
@@ -1227,11 +1279,11 @@ fn audio_status(state: State<'_, AppState>) -> AudioStatus {
 fn record_start(state: State<'_, AppState>, name: String) -> Res<String> {
     let safe: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || " -_()".contains(c) { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || " -_(),#%".contains(c) { c } else { '_' })
         .collect::<String>()
         .trim()
         .chars()
-        .take(100)
+        .take(160)
         .collect();
     let mut path = state.dirs.recordings.join(format!("{safe}.wav"));
     let mut n = 2;
@@ -1348,30 +1400,104 @@ async fn song_backing(app: AppHandle, state: State<'_, AppState>, degrees: Vec<i
         (Some(_), Some(id)) => melody_notes(app.clone(), app.state::<AppState>(), id).await.unwrap_or_default(),
         _ => Vec::new(),
     };
-    if guide.is_some() && style != "voice" && notes.is_empty() {
+    let original = style == "original";
+    if guide.is_some() && style == "choir" && notes.is_empty() {
         return Err("Chưa dò được giai điệu của bài nên chưa tạo được bè hợp xướng.".into());
     }
+    // The record's own backing vocals, split from the singer's (minutes the
+    // first time, then from the cache).
+    let id = state.song.lock().unwrap().source_id.clone();
+    let own = match (&guide, original, id) {
+        (Some(_), true, Some(id)) => Some(original_backing(&app, &state, &id, sr).await?),
+        (Some(_), true, None) => return Err("Bè gốc cần bản thu đã tách giọng.".into()),
+        _ => None,
+    };
+    if state.generation.load(Relaxed) != gen {
+        return Err("superseded".into());
+    }
+    let chords = if guide.is_some() && !original { song_chords(&state).await } else { Vec::new() };
+    let parts = state.song.lock().unwrap().backing_parts.clone();
     let made = blocking(move || {
         guide.map(|g| {
-            Arc::new(if style2 == "voice" {
-                audio::backing::harmony(&g, sr, tonic, minor, &degrees2, &notes)
+            let raw = Arc::new(if let Some(mut b) = own {
+                // On the vocal's timeline, as long as it.
+                b.resize(g.len(), 0.0);
+                b
+            } else if style2 == "voice" {
+                audio::backing::harmony(&g, sr, tonic, minor, &degrees2, &notes, &chords)
             } else {
-                audio::backing::choir(g.len() / 2, sr, tonic, minor, &degrees2, &notes)
-            })
+                audio::backing::choir(g.len() / 2, sr, tonic, minor, &degrees2, &notes, &chords)
+            });
+            let layer = backing_layer(&raw, sr, &parts, &style2);
+            (raw, layer, parts)
         })
     })
     .await?;
     if state.generation.load(Relaxed) != gen {
         return Err("superseded".into());
     }
-    {
+    let stale = {
         let mut s = state.song.lock().unwrap();
-        s.backing_raw = made;
+        let stale = made.as_ref().is_some_and(|m| m.2 != s.backing_parts);
+        s.backing_raw = made.as_ref().map(|m| m.0.clone());
+        s.backing = made.map(|m| m.1);
         s.backing_degrees = degrees;
         s.backing_style = style;
-        refresh_backing(&mut s);
+        stale
+    };
+    // The parts changed while it was being made: cut it to the new ones.
+    if stale {
+        refresh_backing(&state).await?;
     }
     swap_layers(&state).await
+}
+
+/// Progress of splitting a recording's backing vocals (`backing://progress`).
+#[derive(Serialize, Clone)]
+struct BackingProgress {
+    source: String,
+    fraction: f32,
+}
+
+/// The record's own backing vocals for `source`, at `sr`: its separated
+/// vocal split by the karaoke model (`audio::karaoke`) into lead and
+/// backing, kept as `<id>.backing.wav` in the stems dir. One at a time (the
+/// model takes about 5 GB), on half the cores; minutes for a song.
+async fn original_backing(app: &AppHandle, state: &AppState, source: &str, sr: u32) -> Res<Vec<f32>> {
+    static ONE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let (_, vocals) = stem_paths(&state.dirs.stems, source)?;
+    let file = state.dirs.stems.join(format!("{source}.backing.wav"));
+    let _turn = ONE.lock().await;
+    if !file.is_file() {
+        let model = state.dirs.tools.join("models").join(audio::karaoke::MODEL_FILE);
+        if !model.is_file() {
+            return Err("Chưa có mô hình tách bè gốc (tạo bằng scripts/export_karaoke.sh).".into());
+        }
+        if !vocals.is_file() {
+            return Err("Chưa có giọng ca sĩ đã tách của bài.".into());
+        }
+        let (app2, id, out) = (app.clone(), source.to_string(), file.clone());
+        blocking(move || -> Res<()> {
+            let vocal = audio::decode::decode_file(&vocals, audio::karaoke::RATE)?;
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).div_ceil(2);
+            let mut model = audio::karaoke::LeadSplitter::load(&model, threads)?;
+            let mut last = -1.0f32;
+            let parts = model.split(&vocal, |f| {
+                if f - last >= 0.01 {
+                    last = f;
+                    let _ = app2.emit("backing://progress", BackingProgress { source: id.clone(), fraction: f });
+                }
+                true
+            })?;
+            // Written next to it first, so a stopped run leaves no half file.
+            let tmp = out.with_extension("wav.part");
+            audio::decode::write_wav(&tmp, &parts.backing, audio::karaoke::RATE)?;
+            std::fs::rename(&tmp, &out).map_err(|e| e.to_string())
+        })
+        .await??;
+    }
+    let file2 = file.clone();
+    blocking(move || audio::decode::decode_file(&file2, sr)).await?
 }
 
 /// `count` frames of gain: 1 inside `parts` (seconds), 0 outside. The short
@@ -1401,15 +1527,38 @@ fn keep_parts(buf: &[f32], sr: u32, parts: &[(f64, f64)]) -> Vec<f32> {
 
 /// Rebuild the harmony from the chosen parts (the whole song when no part is
 /// chosen for it). Cheap: done under the song's lock.
-fn refresh_backing(s: &mut Song) {
-    let sr = s.sr;
-    s.backing = s.backing_raw.as_ref().map(|r| {
-        if s.backing_parts.is_empty() {
-            r.clone()
-        } else {
-            Arc::new(keep_parts(r, sr, &s.backing_parts))
-        }
-    });
+async fn refresh_backing(state: &AppState) -> Res<()> {
+    let (raw, sr, parts, style) = {
+        let s = state.song.lock().unwrap();
+        (s.backing_raw.clone(), s.sr, s.backing_parts.clone(), s.backing_style.clone())
+    };
+    let Some(raw) = raw else {
+        state.song.lock().unwrap().backing = None;
+        return Ok(());
+    };
+    let layer = {
+        let (raw, parts) = (raw.clone(), parts.clone());
+        blocking(move || backing_layer(&raw, sr, &parts, &style)).await?
+    };
+    let mut s = state.song.lock().unwrap();
+    // Only if nothing changed meanwhile (a newer call does its own).
+    if s.backing_raw.as_ref().is_some_and(|r| Arc::ptr_eq(r, &raw)) && s.backing_parts == parts {
+        s.backing = Some(layer);
+    }
+    Ok(())
+}
+
+/// The harmony as heard: `raw` kept to `parts` (all of it without any),
+/// then mixed like recorded backing vocals (its room rings on past a part's
+/// end, as a real one would).
+fn backing_layer(raw: &[f32], sr: u32, parts: &[(f64, f64)], style: &str) -> Arc<Vec<f32>> {
+    // The record's own backing is already mixed, and sings only where the
+    // record has it: all of it, as it is.
+    if style == "original" {
+        return Arc::new(raw.to_vec());
+    }
+    let kept = if parts.is_empty() { None } else { Some(keep_parts(raw, sr, parts)) };
+    Arc::new(audio::backing::polish(kept.as_deref().unwrap_or(raw), sr, style == "voice"))
 }
 
 /// Rebuild the original singer's layer from the chosen parts. Where a part
@@ -1589,8 +1738,8 @@ async fn song_parts(
         }
         s.backing_parts = backing;
         s.original_parts = original;
-        refresh_backing(&mut s);
     }
+    refresh_backing(&state).await?;
     refresh_lead(&app, &state).await?;
     swap_layers(&state).await
 }
@@ -1678,7 +1827,81 @@ fn video_ffmpeg_backdrop(state: State<'_, AppState>, request: tauri::ipc::Reques
         return Err("Dữ liệu ảnh nền không hợp lệ".into());
     };
     let part = video_part(&state, &request)?;
-    std::fs::write(part.with_extension("part.bg.png"), bytes).map_err(|e| e.to_string())
+    // `x-format: yuv420p`: a still picture already in the video's format.
+    let raw = request.headers().get("x-format").and_then(|v| v.to_str().ok()) == Some("yuv420p");
+    std::fs::write(part.with_extension(if raw { "part.bg.yuv" } else { "part.bg.png" }), bytes).map_err(|e| e.to_string())
+}
+
+/// Write one yuv420p frame to `out`: the still background `still` (`w`×`h`)
+/// with the lyric band (yuva420p planes of `rows` rows from row `y`, as
+/// `video_ffmpeg_frame` gets them) laid over it; straight alpha, chroma by
+/// the mean alpha of its 2×2 pixels, as ffmpeg's overlay does.
+fn composite_still(still: &[u8], band: &[u8], w: usize, h: usize, y: usize, rows: usize, out: &mut impl std::io::Write) -> std::io::Result<()> {
+    let n = w * rows;
+    let (cw, ch) = (w / 2, h / 2);
+    let (sy, su, sv) = (&still[..w * h], &still[w * h..w * h + cw * ch], &still[w * h + cw * ch..]);
+    let (by, bu, bv, ba) = (&band[..n], &band[n..n + n / 4], &band[n + n / 4..n + n / 2], &band[n + n / 2..]);
+    let mix = |f: u8, b: u8, a: u32| ((f as u32 * a + b as u32 * (255 - a) + 127) / 255) as u8;
+    let mut row = vec![0u8; w];
+    // Y: untouched rows straight from the still.
+    out.write_all(&sy[..y * w])?;
+    for r in 0..rows {
+        let (s, f, a) = (&sy[(y + r) * w..(y + r + 1) * w], &by[r * w..(r + 1) * w], &ba[r * w..(r + 1) * w]);
+        for x in 0..w {
+            row[x] = if a[x] == 0 { s[x] } else { mix(f[x], s[x], a[x] as u32) };
+        }
+        out.write_all(&row)?;
+    }
+    out.write_all(&sy[(y + rows) * w..])?;
+    // U and V: half size, alpha averaged over each 2×2 block.
+    let (cy, crows) = (y / 2, rows / 2);
+    for (sp, fp) in [(su, bu), (sv, bv)] {
+        out.write_all(&sp[..cy * cw])?;
+        for r in 0..crows {
+            let (s, f) = (&sp[(cy + r) * cw..(cy + r + 1) * cw], &fp[r * cw..(r + 1) * cw]);
+            for x in 0..cw {
+                let at = |dr: usize, dc: usize| ba[(2 * r + dr) * w + 2 * x + dc] as u32;
+                let a = (at(0, 0) + at(0, 1) + at(1, 0) + at(1, 1) + 2) / 4;
+                row[x] = if a == 0 { s[x] } else { mix(f[x], s[x], a) };
+            }
+            out.write_all(&row[..cw])?;
+        }
+        out.write_all(&sp[(cy + crows) * cw..])?;
+    }
+    Ok(())
+}
+
+/// Keep a copy of the picture the user chose for the exported video's
+/// background (raw body; `x-ext` its extension) in the cache, where the page
+/// can read it, one per song. A new name each time (the webview caches by
+/// URL); that song's previous copies go. Returns its path.
+#[tauri::command]
+fn export_image_save(state: State<'_, AppState>, request: tauri::ipc::Request<'_>) -> Res<String> {
+    let tauri::ipc::InvokeBody::Raw(bytes) = request.body() else {
+        return Err("Dữ liệu hình không hợp lệ".into());
+    };
+    let ext = request.headers().get("x-ext").and_then(|v| v.to_str().ok()).unwrap_or("img").to_ascii_lowercase();
+    if !["png", "jpg", "jpeg", "webp", "gif", "bmp", "avif"].contains(&ext.as_str()) {
+        return Err("Chỉ dùng được hình PNG, JPEG, WebP, GIF, BMP hoặc AVIF".into());
+    }
+    if bytes.is_empty() || bytes.len() > 64 << 20 {
+        return Err("Hình rỗng hoặc quá lớn (tối đa 64 MB)".into());
+    }
+    // Each song its own picture (`x-song`: the song's id); only its older copies go.
+    let song: String = request.headers().get("x-song").and_then(|v| v.to_str().ok()).unwrap_or("all").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(64).collect();
+    // (A dot ends the id: ids never hold one, so one song's prefix never matches another's.)
+    let prefix = format!("export-background-{song}.");
+    if let Ok(entries) = std::fs::read_dir(&state.dirs.cache) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    let path = state.dirs.cache.join(format!("{prefix}{stamp}.{ext}"));
+    std::fs::write(&path, bytes).map_err(|e| format!("Không lưu được hình: {e}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 // ------------------------------------------------------------------ store --
@@ -1726,8 +1949,13 @@ fn store_set(state: State<'_, AppState>, key: String, value: Option<String>) -> 
 
 /// A line from the UI in the app's log (e.g. how long an export took).
 #[tauri::command]
-fn dev_log(text: String) {
+fn dev_log(state: State<'_, AppState>, text: String) {
+    use std::io::Write;
     eprintln!("[ui] {text}");
+    // Also kept in the cache dir's ui.log (the terminal may not be at hand).
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(state.dirs.cache.join("ui.log")) {
+        let _ = writeln!(f, "{text}");
+    }
 }
 
 /// One more piece of the looping background (raw MJPEG frames, `x-path`
@@ -1785,6 +2013,12 @@ enum Under<'a> {
     Video(&'a Path, f64, f64),
     Loop(&'a Path),
     Still,
+    /// Frames arrive whole (lyrics laid on a still picture here): only encode.
+    Composited,
+}
+enum UnderKind {
+    Composited,
+    Other,
 }
 
 /// The ffmpeg arguments that composite the export. Inputs: what lies
@@ -1814,6 +2048,20 @@ fn ffmpeg_args(
         add(a, &["-loop", "1", "-framerate", &rate, "-i"]);
         a.push(backdrop.as_os_str().to_owned());
     };
+    if let Under::Composited = under {
+        let size = format!("{width}x{height}");
+        add(&mut a, &["-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", &size, "-framerate", &rate, "-i", "pipe:0", "-i"]);
+        a.push(wav.as_os_str().to_owned());
+        add(&mut a, &["-map", "0:v", "-map", "1:a"]);
+        if vaapi.is_some() {
+            add(&mut a, &["-vf", "format=nv12,hwupload", "-c:v", "h264_vaapi", "-qp", "17", "-profile:v", "high"]);
+        } else {
+            add(&mut a, &["-c:v", "libx264", "-preset", "fast", "-crf", "16", "-profile:v", "high", "-pix_fmt", "yuv420p"]);
+        }
+        add(&mut a, &["-c:a", "aac", "-b:a", "256k", "-shortest", "-movflags", "+faststart", "-f", "mp4"]);
+        a.push(out.as_os_str().to_owned());
+        return a;
+    }
     // Inputs in order; `lyrics` is the index of the frames' input.
     let (base, lyrics) = match under {
         Under::Video(path, from, tempo) => {
@@ -1837,6 +2085,7 @@ fn ffmpeg_args(
             still(&mut a);
             (format!("[0:v]{}[b];", fit("lanczos")), 1)
         }
+        Under::Composited => unreachable!(),
     };
     let tail = if vaapi.is_some() { "format=nv12,hwupload" } else { "format=yuv420p" };
     let graph = format!("{base}[b][{lyrics}:v]overlay=shortest=1:format=yuv420,{tail}[out]");
@@ -1878,7 +2127,9 @@ fn video_ffmpeg_begin(
     use std::process::{Command, Stdio};
     let part = checked_part(&state, &path)?;
     let backdrop = part.with_extension("part.bg.png");
-    if !backdrop.exists() {
+    // A still picture already in yuv420p: the lyrics are laid on it here.
+    let still = std::fs::read(part.with_extension("part.bg.yuv")).ok().filter(|b| b.len() == (width * height * 3 / 2) as usize);
+    if still.is_none() && !backdrop.exists() {
         return Err("Chưa có ảnh nền video".into());
     }
     let video = match video {
@@ -1904,8 +2155,10 @@ fn video_ffmpeg_begin(
     let under = match (&video, ambient.unwrap_or(false)) {
         (Some(v), _) => Under::Video(v, video_from, tempo),
         (None, true) if looped.is_file() => Under::Loop(&looped),
+        _ if still.is_some() => Under::Composited,
         _ => Under::Still,
     };
+    let under_kind = if matches!(under, Under::Composited) { UnderKind::Composited } else { UnderKind::Other };
     let vaapi = vaapi_device();
     let args = ffmpeg_args(under, &backdrop, &wav, &part, (width, height, fps), vaapi);
     let child = Command::new("ffmpeg")
@@ -1918,6 +2171,8 @@ fn video_ffmpeg_begin(
     if let Some(mut old) = state.encoder.lock().unwrap().replace(child) {
         let _ = old.kill();
     }
+    let composited = matches!(under_kind, UnderKind::Composited);
+    *state.encoder_still.lock().unwrap() = if composited { still } else { None };
     Ok(ExportSound { sample_rate: sr, first, frames: last - first, hardware: vaapi.is_some() })
 }
 
@@ -1943,6 +2198,16 @@ fn video_ffmpeg_frame(state: State<'_, AppState>, request: tauri::ipc::Request<'
     }
     let mut enc = state.encoder.lock().unwrap();
     let stdin = enc.as_mut().and_then(|c| c.stdin.as_mut()).ok_or("Chưa bắt đầu xuất video")?;
+    // On a still background the lyrics are laid on it here: a plain frame for ffmpeg.
+    if let Some(still) = state.encoder_still.lock().unwrap().as_deref() {
+        if still.len() != w * h * 3 / 2 {
+            return Err("Ảnh nền không khớp khung hình".into());
+        }
+        let mut out = std::io::BufWriter::with_capacity(1 << 20, &mut *stdin);
+        return composite_still(still, band, w, h, y, rows, &mut out)
+            .and_then(|_| out.flush())
+            .map_err(|e| format!("ffmpeg dừng giữa chừng: {e}"));
+    }
     let zeros = |out: &mut std::process::ChildStdin, mut n: usize| -> std::io::Result<()> {
         while n > 0 {
             let k = n.min(ZEROS.len());
@@ -1979,6 +2244,8 @@ async fn video_ffmpeg_finish(state: State<'_, AppState>, path: String) -> Res<St
     .await??;
     let _ = std::fs::remove_file(part.with_extension("part.wav"));
     let _ = std::fs::remove_file(part.with_extension("part.bg.png"));
+    let _ = std::fs::remove_file(part.with_extension("part.bg.yuv"));
+    *state.encoder_still.lock().unwrap() = None;
     let _ = std::fs::remove_file(part.with_extension("part.loop.mjpeg"));
     if !status.success() {
         let why = std::fs::read_to_string(&log).unwrap_or_default();
@@ -1991,6 +2258,136 @@ async fn video_ffmpeg_finish(state: State<'_, AppState>, path: String) -> Res<St
     Ok(mp4.to_string_lossy().into_owned())
 }
 
+/// A fast export being put together (see `fastvideo`): the still picture,
+/// the frames recorded so far, and the audio encoding alongside.
+struct FastExport {
+    part: PathBuf,
+    width: u32,
+    height: u32,
+    fps: u32,
+    still: Vec<u8>,
+    chunks: Vec<fastvideo::canvas::Chunk>,
+    /// Writing the sound out and encoding it (started in the background).
+    audio: Option<std::thread::JoinHandle<Res<std::process::Child>>>,
+}
+
+impl FastExport {
+    /// Its own files (the still picture stays for the caller: a failed start
+    /// falls back to the ordinary export, which removes it).
+    fn files(part: &Path) -> [PathBuf; 3] {
+        ["part.wav", "part.m4a", "part.h264"].map(|e| part.with_extension(e))
+    }
+    fn drop_files(part: &Path) {
+        for f in Self::files(part) {
+            let _ = std::fs::remove_file(f);
+        }
+    }
+}
+
+/// Start a fast export: the still picture (sent as yuv420p with
+/// `video_ffmpeg_backdrop`) and the sound; the frames come next as recorded
+/// canvas calls (`video_fast_chunk`).
+#[tauri::command]
+fn video_fast_begin(state: State<'_, AppState>, path: String, width: u32, height: u32, fps: u32, trim_start: f64, trim_end: f64) -> Res<ExportSound> {
+    let part = checked_part(&state, &path)?;
+    let still = std::fs::read(part.with_extension("part.bg.yuv")).map_err(|_| "Chưa có ảnh nền video".to_string())?;
+    if width % 2 != 0 || height % 2 != 0 || still.len() != (width * height * 3 / 2) as usize {
+        return Err("Ảnh nền không khớp khung hình".into());
+    }
+    let mix = export_mix(&state)?;
+    let sr = state.engine.sample_rate();
+    let total = mix.len() / 2;
+    let first = ((trim_start.max(0.0) * sr as f64).round() as usize).min(total);
+    let last = total.saturating_sub((trim_end.max(0.0) * sr as f64).round() as usize).max(first);
+    // The sound is written and encoded in the background while the frames
+    // are recorded and drawn.
+    let (wav, m4a) = (part.with_extension("part.wav"), part.with_extension("part.m4a"));
+    let audio = std::thread::spawn(move || -> Res<std::process::Child> {
+        audio::decode::write_wav(&wav, &mix[2 * first..2 * last], sr)?;
+        fastvideo::encode_audio(&wav, &m4a).map_err(|e| format!("Không chạy được ffmpeg: {e}"))
+    });
+    state.fast_cancel.store(false, Relaxed);
+    if let Some(mut old) = state.fast.lock().unwrap().replace(FastExport { part, width, height, fps, still, chunks: Vec::new(), audio: Some(audio) }) {
+        if let Some(Ok(Ok(mut a))) = old.audio.take().map(|h| h.join()) {
+            let _ = a.kill();
+        }
+    }
+    Ok(ExportSound { sample_rate: sr, first, frames: last - first, hardware: false })
+}
+
+/// Recorded frames for the fast export (raw body, `x-path` header).
+#[tauri::command]
+fn video_fast_chunk(state: State<'_, AppState>, request: tauri::ipc::Request<'_>) -> Res<()> {
+    let path = request.headers().get("x-path").and_then(|v| v.to_str().ok()).map(percent_decode).unwrap_or_default();
+    let bytes = match request.body() {
+        tauri::ipc::InvokeBody::Raw(b) => b.clone(),
+        _ => return Err("Thiếu dữ liệu khung hình".into()),
+    };
+    let chunk = fastvideo::canvas::Chunk::parse(bytes)?;
+    let mut fast = state.fast.lock().unwrap();
+    let job = fast.as_mut().filter(|j| j.part == Path::new(&path)).ok_or("Chưa bắt đầu xuất video")?;
+    job.chunks.push(chunk);
+    Ok(())
+}
+
+/// Draw and encode the recorded frames, add the sound, and save the video.
+/// Progress goes out as `export://fast` events (0–1).
+#[tauri::command]
+async fn video_fast_finish(app: AppHandle, state: State<'_, AppState>, path: String, frames: usize) -> Res<String> {
+    let part = checked_part(&state, &path)?;
+    let mut job = state.fast.lock().unwrap().take().filter(|j| j.part == part).ok_or("Chưa bắt đầu xuất video")?;
+    let cancel = state.fast_cancel.clone();
+    let audio = job.audio.take();
+    let started = std::time::Instant::now();
+    let result = blocking(move || -> Res<String> {
+        let input = fastvideo::Job { width: job.width, height: job.height, fps: job.fps, still: std::mem::take(&mut job.still), chunks: std::mem::take(&mut job.chunks), frames };
+        let last = std::sync::Mutex::new(0.0f32);
+        let report = |f: f32| {
+            let mut l = last.lock().unwrap();
+            if f - *l >= 0.01 {
+                *l = f;
+                let _ = app.emit("export://fast", f);
+            }
+        };
+        let stream = fastvideo::encode(&input, &report, &cancel)?;
+        let h264 = part.with_extension("part.h264");
+        std::fs::write(&h264, &stream).map_err(|e| format!("Không ghi được video: {e}"))?;
+        drop(stream);
+        if let Some(a) = audio {
+            let mut a = a.join().map_err(|_| "Lỗi khi ghi tiếng".to_string())??;
+            let ok = a.wait().map(|s| s.success()).unwrap_or(false);
+            if !ok {
+                return Err("ffmpeg không mã hóa được tiếng".into());
+            }
+        }
+        fastvideo::mux(&h264, &part.with_extension("part.m4a"), job.fps, &part)?;
+        let mp4 = part.with_extension("");
+        std::fs::rename(&part, &mp4).map_err(|e| format!("Không lưu được video: {e}"))?;
+        Ok(mp4.to_string_lossy().into_owned())
+    })
+    .await;
+    let part = checked_part(&state, &path)?;
+    FastExport::drop_files(&part);
+    let out = result??;
+    let _ = std::fs::remove_file(part.with_extension("part.bg.yuv"));
+    eprintln!("fast export: {frames} frames in {:.1}s (drawing and encoding)", started.elapsed().as_secs_f32());
+    Ok(out)
+}
+
+/// Stop a fast export and drop its files.
+#[tauri::command]
+fn video_fast_abort(state: State<'_, AppState>, path: String) {
+    state.fast_cancel.store(true, Relaxed);
+    if let Some(mut job) = state.fast.lock().unwrap().take() {
+        if let Some(Ok(Ok(mut a))) = job.audio.take().map(|h| h.join()) {
+            let _ = a.kill();
+        }
+    }
+    if let Ok(part) = checked_part(&state, &path) {
+        FastExport::drop_files(&part);
+    }
+}
+
 /// Stop a running ffmpeg export and drop its files.
 #[tauri::command]
 fn video_ffmpeg_abort(state: State<'_, AppState>, path: String) {
@@ -1998,8 +2395,9 @@ fn video_ffmpeg_abort(state: State<'_, AppState>, path: String) {
         let _ = c.kill();
         let _ = c.wait();
     }
+    *state.encoder_still.lock().unwrap() = None;
     if let Ok(part) = checked_part(&state, &path) {
-        for p in [part.with_extension("part.wav"), part.with_extension("part.log"), part.with_extension("part.bg.png"), part.with_extension("part.loop.mjpeg"), part] {
+        for p in [part.with_extension("part.wav"), part.with_extension("part.log"), part.with_extension("part.bg.png"), part.with_extension("part.bg.yuv"), part.with_extension("part.loop.mjpeg"), part] {
             let _ = std::fs::remove_file(p);
         }
     }
@@ -2014,11 +2412,11 @@ fn video_ffmpeg_abort(state: State<'_, AppState>, path: String) {
 fn video_begin(state: State<'_, AppState>, name: String) -> Res<String> {
     let safe: String = name
         .chars()
-        .map(|c| if c.is_alphanumeric() || " -_()".contains(c) { c } else { '_' })
+        .map(|c| if c.is_alphanumeric() || " -_(),#%".contains(c) { c } else { '_' })
         .collect::<String>()
         .trim()
         .chars()
-        .take(100)
+        .take(160)
         .collect();
     let safe = if safe.is_empty() { "Karaoke".to_string() } else { safe };
     std::fs::create_dir_all(&state.dirs.recordings).map_err(|e| e.to_string())?;
@@ -2296,6 +2694,9 @@ pub fn run() {
                 engine,
                 dirs,
                 encoder: Mutex::new(None),
+                encoder_still: Mutex::new(None),
+                fast: Mutex::new(None),
+                fast_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 song: Mutex::new(Song::default()),
                 generation,
                 separator: Arc::new(Mutex::new(None)),
@@ -2357,15 +2758,55 @@ pub fn run() {
             video_ffmpeg_backdrop,
             dev_log,
             store_load,
+            song_beats,
+            export_image_save,
             store_set,
             video_ffmpeg_loop,
             video_ffmpeg_begin,
             video_ffmpeg_frame,
             video_ffmpeg_finish,
             video_ffmpeg_abort,
+            video_fast_begin,
+            video_fast_chunk,
+            video_fast_finish,
+            video_fast_abort,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Open Karaoke");
+}
+
+#[cfg(test)]
+mod composite_tests {
+    use super::composite_still;
+
+    /// Transparent lyrics leave the picture as it is; opaque ones replace it; half alpha mixes.
+    #[test]
+    fn lays_the_band_on_the_still() {
+        let (w, h) = (4usize, 4usize);
+        let still: Vec<u8> = (0..w * h * 3 / 2).map(|i| if i < w * h { 100 } else { 128 }).collect();
+        // A band of rows 2..4: Y 200, U 90, V 160; alpha 0 on the left half, 255 on the right.
+        let (y, rows) = (2usize, 2usize);
+        let n = w * rows;
+        let mut band = vec![200u8; n];
+        band.extend(vec![90u8; n / 4]);
+        band.extend(vec![160u8; n / 4]);
+        band.extend((0..n).map(|i| if i % w >= 2 { 255 } else { 0 }));
+        let mut out = Vec::new();
+        composite_still(&still, &band, w, h, y, rows, &mut out).unwrap();
+        assert_eq!(out.len(), still.len());
+        assert_eq!(&out[..2 * w], &still[..2 * w], "rows above untouched");
+        assert_eq!(&out[2 * w..3 * w], &[100, 100, 200, 200], "left transparent, right opaque");
+        // Chroma (2×2 at the bottom right): the block under opaque pixels takes the band's colour.
+        let (u, v) = (w * h, w * h + w * h / 4);
+        assert_eq!((out[u + 3], out[v + 3]), (90, 160));
+        assert_eq!((out[u + 2], out[v + 2]), (128, 128));
+
+        // Half alpha mixes halfway.
+        let half: Vec<u8> = band.iter().enumerate().map(|(i, &b)| if i >= n + n / 2 { 128 } else { b }).collect();
+        let mut out = Vec::new();
+        composite_still(&still, &half, w, h, y, rows, &mut out).unwrap();
+        assert_eq!(out[2 * w], 150);
+    }
 }
 
 #[cfg(test)]

@@ -4,6 +4,9 @@
  */
 import { lineAt, type Line } from "./lrc";
 import {
+  clamp01,
+  linePitch,
+  phraseStarts,
   ANCHOR,
   COUNT_GAP,
   LEAD_IN,
@@ -18,6 +21,11 @@ import {
   lineJoin,
   restAfter,
   wordProgress,
+  wipeEdge,
+  litAlong,
+  restAt,
+  breath,
+  wavyTail,
 } from "./lyricCues";
 import { SINGER_LABEL, type Singer } from "./parts";
 
@@ -106,17 +114,77 @@ export function drawer(
   artist: string,
   style: LyricStyle = "scroll",
   singers: (Singer | undefined)[] = [],
+  /** Singing aids: the original melody (recording time, `offset` = lyric to
+   * recording time) for pitch marks above the words, and the song's beats
+   * (lyric time) for counting in on the beat. */
+  aids: {
+    notes?: { start: number; end: number; midi: number }[] | null;
+    /** How the melody shows: a ribbon under the line, dots over the words, or a lane of notes. */
+    look?: "ribbon" | "dots" | "lane";
+    offset?: number;
+    beats?: number[] | null;
+  } = {},
 ) {
   const portrait = H > W;
   // Same proportions as the stage: one size for every line, wrapped once.
   const size = Math.round(portrait ? W * 0.068 : H * 0.072);
   const em = (x: number) => x * size;
-  const lh = em(1.15);
+  // The melody ribbon needs room under each row.
+  const pitchOn = !!aids.notes?.length;
+  const melodyLook = aids.look ?? "ribbon";
+  // On the words (ribbon under, dots over): room around each row. The lane needs none.
+  const onWords = pitchOn && melodyLook !== "lane";
+  const lh = em(onWords ? 1.78 : 1.15);
   const margin = em(0.16);
   const maxWidth = W - 2 * Math.max(em(0.9), W * 0.05);
   const fontLine = `700 ${size}px ${font}`;
   ctx.font = fontLine;
   const space = ctx.measureText(" ").width;
+
+  // Classic karaoke shows a line on one row: a line too long for it is
+  // split into its phrases (at its breaths and pauses) rather than shrunk a lot.
+  if (style === "classic") {
+    const avail = W - 2 * Math.max(em(0.9), W * 0.06);
+    const split: Line[] = [];
+    const who: (Singer | undefined)[] = [];
+    lines.forEach((line, li) => {
+      const widths = line.words.map((w) => ctx.measureText(w.text).width + em(0.3));
+      const total = widths.reduce((a, b) => a + b, 0) + space * Math.max(0, widths.length - 1);
+      const starts = phraseStarts(line);
+      if (total <= avail / 0.85 || starts.filter(Boolean).length < 2) {
+        split.push(line);
+        who.push(singers[li]);
+        return;
+      }
+      // Phrases packed into rows that fit.
+      let chunk: number[] = [];
+      let used = 0;
+      const flush = () => {
+        if (!chunk.length) return;
+        const ws = chunk.map((k) => line.words[k]);
+        split.push({ ...line, words: ws, start: ws[0].start, end: ws[ws.length - 1].end, text: ws.map((w) => w.text).join(" ") });
+        who.push(singers[li]);
+        chunk = [];
+        used = 0;
+      };
+      let k = 0;
+      while (k < line.words.length) {
+        let j = k;
+        while (j + 1 < line.words.length && !starts[j + 1]) j++;
+        const group = Array.from({ length: j - k + 1 }, (_, n) => k + n);
+        const gw = group.reduce((a, n) => a + widths[n], 0) + space * group.length;
+        if (chunk.length && used + gw > avail) flush();
+        chunk.push(...group);
+        used += gw;
+        k = j + 1;
+      }
+      flush();
+    });
+    lines = split;
+    singers = who;
+  }
+  // The melody over each word, for the ribbon under the line.
+  const pitches = lines.map((l) => (onWords ? linePitch(l, aids.notes, aids.offset ?? 0) : null));
 
   // ---- lay out the whole track once (intro, then every line)
   const titleSize = Math.round(em(1.2));
@@ -137,17 +205,31 @@ export function drawer(
     let row = 0;
     let x = 0;
     const li = items.length - 1;
-    line.words.forEach((w, k) => {
+    const sizes = line.words.map((w, k) => {
       const last = k === line.words.length - 1;
       const width = ctx.measureText(w.text).width;
       // A stand-in for unheard singing (♪♪♪) has no held-note trail.
       const hold = isHeld(w, last) && !line.hum ? em(holdLength(w) + 0.14) : 0;
       const rest = last ? lineJoin(lines, li) : restAfter(line, k);
-      const total = width + hold + em(restWidth(rest));
+      return { width, hold, rest, total: width + hold + em(restWidth(rest)) };
+    });
+    // Rows break between phrases (at breaths and pauses), so each row is
+    // sung in one go; inside a phrase only when it alone is too long.
+    const starts = phraseStarts(line);
+    const phraseWidth = (k: number) => {
+      let w = sizes[k].total;
+      for (let j = k + 1; j < sizes.length && !starts[j]; j++) w += space + sizes[j].total;
+      return w;
+    };
+    line.words.forEach((_, k) => {
+      const { width, hold, rest, total } = sizes[k];
       // Classic karaoke keeps each line on one row (shrunk to fit when drawn).
-      if (x > 0 && x + space + total > maxWidth && style !== "classic") {
-        row++;
-        x = 0;
+      if (x > 0 && style !== "classic") {
+        const fits = starts[k] ? x + space + phraseWidth(k) <= maxWidth : x + space + total <= maxWidth;
+        if (!fits) {
+          row++;
+          x = 0;
+        }
       }
       if (x > 0) x += space;
       placed.push({ k, x, row, width, hold, rest });
@@ -209,12 +291,11 @@ export function drawer(
     x: number,
     baseline: number,
     t: number,
-    focused: boolean,
   ) => {
     const line = lines[li];
     const w = line.words[pl.k];
     const lastWord = pl.k === line.words.length - 1;
-    const { lit, hold, held } = wordProgress(w, t, lastWord);
+    const { lit, hold, held } = wordProgress(w, t, lastWord, line, pl.k);
     if (pl.k === 0) {
       // Entry glow: swells and brightens like a breath in during a short
       // gap before the line, fullest when it is time to sing.
@@ -249,18 +330,25 @@ export function drawer(
         ? SINGER_COLORS[who].over
         : [accent, "#ff7aa8"]
       : ["#ffffff", who ? SINGER_COLORS[who].soft : "#ffe0ec"];
-    if (lit <= 0) {
+    // One soft edge sliding through the line (`wipeEdge`, as on stage).
+    const edge = wipeEdge(line, pl.k, t);
+    if (lit <= 0 || edge.to <= 0) {
       ctx.fillStyle = todo;
-    } else {
+    } else if (edge.from >= 1) {
       const g = ctx.createLinearGradient(x, 0, x + pl.width, 0);
       g.addColorStop(0, doneA);
-      if (lit < 1) {
-        g.addColorStop(focused ? Math.max(0, lit - 0.04) : lit, doneB);
-        g.addColorStop(lit, todo);
-        g.addColorStop(1, todo);
-      } else {
-        g.addColorStop(1, doneB);
-      }
+      g.addColorStop(1, doneB);
+      ctx.fillStyle = g;
+    } else {
+      // From the word's start (or the edge, if it starts before) to the
+      // edge's end: done colours, then the fade to unlit.
+      const x0 = x + Math.min(0, edge.from) * pl.width;
+      const x1 = x + edge.to * pl.width;
+      const g = ctx.createLinearGradient(x0, 0, x1, 0);
+      const span = Math.max(1e-6, x1 - x0);
+      g.addColorStop(0, doneA);
+      g.addColorStop(Math.min(1, Math.max(0, (x + edge.from * pl.width - x0) / span)), doneB);
+      g.addColorStop(1, todo);
       ctx.fillStyle = g;
     }
     if (t >= w.end) {
@@ -330,7 +418,10 @@ export function drawer(
     // What the marks mean, accent mark then grey meaning, centred.
     ctx.textAlign = "left";
     const gapX = em(0.5);
-    const parts = LEGEND.map(([m, say]) => {
+    const legend: [string, string][] = pitchOn
+      ? [...LEGEND, melodyLook === "dots" ? ["•", "giai điệu (chấm trên chữ)"] : melodyLook === "lane" ? ["▬", "giai điệu (làn nốt)"] : ["∿", "giai điệu (đường dưới câu)"]]
+      : LEGEND;
+    const parts = legend.map(([m, say]) => {
       ctx.font = `700 ${legendSize}px ${font}`;
       const mw = m ? ctx.measureText(m + " ").width : legendSize * 1.6;
       ctx.font = `500 ${legendSize}px ${font}`;
@@ -376,10 +467,295 @@ export function drawer(
         xOf(widths[pl.row]) + pl.x,
         top + pl.row * lh + em(0.9),
         t,
-        focused,
       );
     const who = singers[li];
     if (who) drawTag(who, xOf(widths[0] ?? 0), top + em(0.9));
+    // The melody ribbon, on the line being sung (classic: both rows, each a line to sing next).
+    if (focused || style === "classic") {
+      if (melodyLook === "ribbon") drawRibbon(li, top, xOf, t);
+      else if (melodyLook === "dots") drawDots(li, top, xOf, t);
+    }
+  };
+
+  /**
+   * The melody as dots over the words of line `li`: one per note, higher for
+   * higher notes, joined by a faint line; lit once sung.
+   */
+  const drawDots = (li: number, top: number, xOf: (rowWidth: number) => number, t: number) => {
+    const segs = pitches[li];
+    if (!segs) return;
+    const line = lines[li];
+    const widths = rowWidths[li + 1];
+    const rows = new Map<number, { x: number; y: number; on: boolean }[]>();
+    for (const pl of items[li + 1].words) {
+      const ws = segs[pl.k];
+      if (!ws?.length) continue;
+      const w = line.words[pl.k];
+      const dur = Math.max(0.08, w.end - w.start);
+      const x = xOf(widths[pl.row]) + pl.x;
+      const base = top + pl.row * lh + em(0.9);
+      const row = rows.get(pl.row) ?? [];
+      for (const sg of ws)
+        row.push({ x: x + ((sg.from + sg.to) / 2) * pl.width, y: base - em(1.1) - sg.h * em(0.32), on: t >= w.start + sg.from * dur });
+      rows.set(pl.row, row);
+    }
+    const color = singers[li] ? SINGER_COLORS[singers[li]!].over[1] : "#ff8fc0";
+    ctx.save();
+    for (const dots of rows.values()) {
+      if (style !== "scroll") {
+        ctx.strokeStyle = "rgba(8, 6, 12, 0.45)";
+        ctx.lineWidth = em(0.06);
+        ctx.beginPath();
+        dots.forEach((d, k) => (k ? ctx.lineTo(d.x, d.y) : ctx.moveTo(d.x, d.y)));
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.2)";
+      ctx.lineWidth = em(0.022);
+      ctx.beginPath();
+      dots.forEach((d, k) => (k ? ctx.lineTo(d.x, d.y) : ctx.moveTo(d.x, d.y)));
+      ctx.stroke();
+      for (const d of dots) {
+        ctx.shadowBlur = 0;
+        if (style !== "scroll") {
+          ctx.fillStyle = "rgba(8, 6, 12, 0.55)";
+          ctx.beginPath();
+          ctx.arc(d.x, d.y, em(d.on ? 0.09 : 0.075), 0, Math.PI * 2);
+          ctx.fill();
+        }
+        if (d.on) {
+          ctx.shadowColor = accent;
+          ctx.shadowBlur = em(0.18);
+        }
+        ctx.fillStyle = d.on ? color : "rgba(255, 255, 255, 0.5)";
+        ctx.beginPath();
+        ctx.arc(d.x, d.y, em(d.on ? 0.065 : 0.05), 0, Math.PI * 2);
+        ctx.fill();
+      }
+    }
+    ctx.restore();
+  };
+
+  // The lane: the song's own pitch range (most of its notes), so bars keep their places.
+  const laneRange = (() => {
+    const ms = (aids.notes ?? []).map((n) => n.midi).sort((a, b) => a - b);
+    if (!ms.length) return [60, 72];
+    const lo = ms[Math.floor(ms.length * 0.03)];
+    const hi = ms[Math.floor(ms.length * 0.97)];
+    return [lo - 1, Math.max(hi + 1, lo + 8)];
+  })();
+
+  /**
+   * The melody as a lane of notes above the lyrics: bars sliding left past a
+   * "now" line, higher for higher notes, longer for longer ones; lit once
+   * sung, glowing while sung. Shown while there are notes nearby.
+   */
+  const drawLane = (t: number) => {
+    const notes = aids.notes;
+    if (!notes?.length) return;
+    const rec = t + (aids.offset ?? 0);
+    const span = 5;
+    const behind = 1.2;
+    const from = rec - behind;
+    const to = from + span;
+    // First note ending after the window starts.
+    let lo = 0;
+    let hi = notes.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (notes[mid].end <= from) lo = mid + 1;
+      else hi = mid;
+    }
+    const shown = [];
+    for (let k = lo; k < notes.length && notes[k].start < to; k++) shown.push(notes[k]);
+    // Fades in and out with the singing around it.
+    const near = (k: number) => (k < 0 || k >= notes.length ? Infinity : Math.min(Math.abs(notes[k].start - rec), Math.abs(notes[k].end - rec)));
+    const gapTo = Math.min(near(lo - 1), near(lo), shown.length ? 0 : Infinity);
+    const alpha = shown.length ? 1 : clamp01(1 - (gapTo - 0.5) / 1.5);
+    if (alpha <= 0) return;
+    const lx = W * (portrait ? 0.06 : 0.12);
+    const lw = W - 2 * lx;
+    const lhgt = em(1.15);
+    // Scrolling lyrics fill the middle: the lane goes at the top. Classic and
+    // subtitles sit low: the lane just above them, close to where the eyes are.
+    const lt =
+      style === "classic" ? H * 0.66 - em(2.5) : style === "subtitle" ? H - em(6.3) : portrait ? H * 0.12 : H * 0.075;
+    const pad = em(0.16);
+    const xAt = (s: number) => lx + ((s - from) / span) * lw;
+    const now = xAt(rec);
+    const [mlo, mhi] = laneRange;
+    const yAt = (m: number) => lt + pad + (1 - clamp01((m - mlo) / (mhi - mlo))) * (lhgt - 2 * pad);
+    const color = "#ff8fc0";
+    ctx.save();
+    ctx.globalAlpha *= alpha;
+    ctx.fillStyle = "rgba(10, 8, 16, 0.5)";
+    ctx.beginPath();
+    ctx.roundRect(lx, lt, lw, lhgt, em(0.2));
+    ctx.fill();
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.06)";
+    ctx.lineWidth = Math.max(1, em(0.012));
+    for (let k = 1; k < 4; k++) {
+      ctx.beginPath();
+      ctx.moveTo(lx + pad, lt + (k * lhgt) / 4);
+      ctx.lineTo(lx + lw - pad, lt + (k * lhgt) / 4);
+      ctx.stroke();
+    }
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(lx + pad * 0.5, lt, lw - pad, lhgt);
+    ctx.clip();
+    const bar = em(0.11);
+    for (const n of shown) {
+      const a = xAt(n.start);
+      const b = Math.max(a + bar, xAt(n.end) - em(0.03));
+      const y = yAt(n.midi) - bar / 2;
+      const past = n.end <= rec;
+      const cur = n.start <= rec && rec < n.end;
+      ctx.shadowBlur = 0;
+      if (cur) {
+        ctx.shadowColor = accent;
+        ctx.shadowBlur = em(0.25);
+      }
+      ctx.fillStyle = cur ? color : past ? "rgba(255, 143, 192, 0.7)" : "rgba(255, 255, 255, 0.32)";
+      ctx.beginPath();
+      ctx.roundRect(a, y, b - a, bar, bar / 2);
+      ctx.fill();
+    }
+    ctx.restore();
+    ctx.shadowBlur = 0;
+    ctx.strokeStyle = "rgba(255, 255, 255, 0.75)";
+    ctx.lineWidth = Math.max(1.5, em(0.025));
+    ctx.beginPath();
+    ctx.moveTo(now, lt + em(0.08));
+    ctx.lineTo(now, lt + lhgt - em(0.08));
+    ctx.stroke();
+    ctx.restore();
+  };
+
+  /**
+   * The melody ribbon under each row of line `li`: a thin line that rises
+   * and falls with the original melody under the words, lit up to where the
+   * singing is, with a dot there.
+   */
+  const drawRibbon = (li: number, top: number, xOf: (rowWidth: number) => number, t: number) => {
+    const segs = pitches[li];
+    if (!segs) return;
+    const line = lines[li];
+    const widths = rowWidths[li + 1];
+    type Span = { k: number; x: number; w: number };
+    const rows = new Map<number, { pts: [number, number][]; lit: number; head: [number, number] | null; words: Span[]; tails: Span[] }>();
+    for (const pl of items[li + 1].words) {
+      const ws = segs[pl.k];
+      if (!ws?.length) continue;
+      const x = xOf(widths[pl.row]) + pl.x;
+      const base = top + pl.row * lh + em(0.9);
+      const yOf = (h: number) => base + em(0.34) + (1 - h) * em(0.38);
+      const row = rows.get(pl.row) ?? { pts: [], lit: -Infinity, head: null, words: [], tails: [] };
+      for (const sg of ws) {
+        // Always forward (a curve that turned back would look like a scribble).
+        const prev = row.pts.length ? row.pts[row.pts.length - 1][0] : -Infinity;
+        const a = Math.max(prev + em(0.02), x + sg.from * pl.width + em(0.04));
+        const b = Math.max(a + em(0.04), x + sg.to * pl.width - em(0.04));
+        row.pts.push([a, yOf(sg.h)], [b, yOf(sg.h)]);
+      }
+      row.words.push({ k: pl.k, x, w: pl.width });
+      // A held note: the ribbon runs on under its trail, gently waving.
+      if (pl.hold > 0 && row.pts.length) {
+        const tx = x + pl.width + em(0.14);
+        const y = row.pts[row.pts.length - 1][1];
+        row.pts.push(...wavyTail(row.pts[row.pts.length - 1][0], tx + pl.hold - em(0.14), y, em(0.035), em(0.16)));
+        row.tails.push({ k: pl.k, x: tx, w: pl.hold - em(0.14) });
+      }
+      rows.set(pl.row, row);
+    }
+    // Where the singing is: with the text's wipe, crossing the spaces too,
+    // and on along a held note's trail.
+    rows.forEach((row) => {
+      row.lit = litAlong(line, row.words, t);
+      for (const tl of row.tails) {
+        const { hold } = wordProgress(line.words[tl.k], t, tl.k === line.words.length - 1, line, tl.k);
+        if (hold > 0) row.lit = Math.max(row.lit, tl.x + hold * tl.w);
+      }
+    });
+    // Resting: the dot breathes, so stillness reads as a rest, not a stop.
+    const rest = restAt(line, t);
+    const puff = rest ? breath(rest.f, line.words[rest.k + 1].start - line.words[rest.k].end) : 1;
+    ctx.save();
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+    const color = singers[li] ? SINGER_COLORS[singers[li]!].over[1] : "#ff8fc0";
+    for (const row of rows.values()) {
+      const P = row.pts;
+      if (P.length < 2) continue;
+      const path = () => {
+        ctx.beginPath();
+        ctx.moveTo(P[0][0], P[0][1]);
+        for (let k = 1; k < P.length; k++) {
+          const [px, py] = P[k - 1];
+          const [cx, cy] = P[k];
+          const mx = (px + cx) / 2;
+          ctx.bezierCurveTo(mx, py, mx, cy, cx, cy);
+        }
+      };
+      if (style !== "scroll") {
+        ctx.strokeStyle = "rgba(8, 6, 12, 0.5)";
+        ctx.lineWidth = em(0.09);
+        path();
+        ctx.stroke();
+      }
+      ctx.strokeStyle = "rgba(255, 255, 255, 0.3)";
+      ctx.lineWidth = em(0.045);
+      path();
+      ctx.stroke();
+      if (row.lit > P[0][0]) {
+        const litTo = Math.min(row.lit, P[P.length - 1][0]);
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(0, 0, litTo, H);
+        ctx.clip();
+        ctx.shadowColor = accent;
+        ctx.shadowBlur = em(0.18);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = em(0.055);
+        path();
+        ctx.stroke();
+        ctx.restore();
+        // The dot where the singing is, while the row is being sung.
+        if (row.lit < P[P.length - 1][0]) {
+          let y = P[0][1];
+          for (let k = 1; k < P.length; k++) {
+            if (P[k][0] >= litTo) {
+              const u = clamp01((litTo - P[k - 1][0]) / Math.max(1, P[k][0] - P[k - 1][0]));
+              const e = u < 0.5 ? 2 * u * u : 1 - 2 * (1 - u) * (1 - u);
+              y = P[k - 1][1] + (P[k][1] - P[k - 1][1]) * e;
+              break;
+            }
+          }
+          ctx.shadowColor = accent;
+          ctx.shadowBlur = em(0.22);
+          ctx.fillStyle = "#ffffff";
+          ctx.beginPath();
+          ctx.arc(litTo, y, em(0.07) * puff, 0, Math.PI * 2);
+          ctx.fill();
+          // Resting: a small ring round the dot fills until the next word.
+          if (rest) {
+            const r = em(0.15);
+            ctx.shadowBlur = 0;
+            ctx.lineWidth = em(0.025);
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.18)";
+            ctx.beginPath();
+            ctx.arc(litTo, y, r, 0, Math.PI * 2);
+            ctx.stroke();
+            ctx.strokeStyle = accent;
+            ctx.shadowColor = accent;
+            ctx.shadowBlur = em(0.08);
+            ctx.beginPath();
+            ctx.arc(litTo, y, r, -Math.PI / 2, -Math.PI / 2 + rest.f * Math.PI * 2);
+            ctx.stroke();
+          }
+        }
+      }
+    }
+    ctx.restore();
   };
   /** The singer's tag left of a line's first row (above it when there is no room). */
   const drawTag = (who: Singer, x0: number, baseline: number) => {
@@ -435,7 +811,7 @@ export function drawer(
       const gap = em(0.27);
       const n = cue.dots;
       const width = n * 2 * r + (n - 1) * gap;
-      [3, 2, 1].slice(3 - n).forEach((num, j) => {
+      Array.from({ length: n }, (_, j) => n - j).forEach((num, j) => {
         const on = cue.count <= num;
         ctx.beginPath();
         ctx.arc(
@@ -486,7 +862,7 @@ export function drawer(
       else drawLine(k, top, (rw) => (W - rw) / 2, t, Math.abs(k - pos) < 0.5);
       ctx.restore();
     }
-    drawCue(cueAt(lines, i, t), W / 2, anchorY - em(0.35));
+    drawCue(cueAt(lines, i, t, aids.beats), W / 2, anchorY - em(0.35));
   };
 
   /** Before the lines come up (classic and subtitle): the title in the middle. */
@@ -554,7 +930,7 @@ export function drawer(
       drawLine(sl.k, 0, () => 0, t, sl.k === i);
       ctx.restore();
     }
-    drawCue(cueAt(lines, i, t), W / 2, top0 - em(0.35));
+    drawCue(cueAt(lines, i, t, aids.beats), W / 2, top0 - em(0.35));
   };
 
   /** Subtitles: the line to sing near the bottom, the next one smaller
@@ -564,7 +940,7 @@ export function drawer(
     const f = focusAt(lines, i, t);
     if (f < 0) {
       introFrame(t);
-      drawCue(cueAt(lines, i, t), W / 2, H * 0.8);
+      drawCue(cueAt(lines, i, t, aids.beats), W / 2, H * 0.8);
       return;
     }
     const e = glideEase((t - focusSince(lines, f)) / GLIDE);
@@ -594,7 +970,7 @@ export function drawer(
       drawLine(f + 1, cy - lineHeight(f + 1) / 2, centred, t, false);
       ctx.restore();
     }
-    drawCue(cueAt(lines, i, t), W / 2, top - em(0.3));
+    drawCue(cueAt(lines, i, t, aids.beats), W / 2, top - em(0.3));
   };
 
   /** `frame`: the video's picture under the lyrics, null for the artwork,
@@ -609,6 +985,7 @@ export function drawer(
     if (style === "classic") classicFrame(t);
     else if (style === "subtitle") subtitleFrame(t);
     else scrollFrame(t);
+    if (pitchOn && melodyLook === "lane") drawLane(t);
   };
 }
 
@@ -619,8 +996,20 @@ export function drawer(
  * another. BT.601 limited range, as ffmpeg's own conversion. Empty when the
  * frame is blank.
  */
-export function lyricBand(ctx: OffscreenCanvasRenderingContext2D, W: number, H: number): { y: number; rows: number; data: ArrayBuffer } {
-  const img = ctx.getImageData(0, 0, W, H);
+export function lyricBand(
+  ctx: OffscreenCanvasRenderingContext2D,
+  W: number,
+  FH: number,
+  /** Rows drawn on this frame (`trackExtent`): only those are read back. */
+  drawn: [number, number] | null = [0, FH],
+): { y: number; rows: number; data: ArrayBuffer } {
+  if (!drawn) return { y: 0, rows: 0, data: new ArrayBuffer(0) };
+  // Reading pixels back is the slow part (8 MB for a whole frame): read the
+  // drawn rows only, from an even row.
+  const from = Math.max(0, Math.floor(drawn[0])) & ~1;
+  const H = Math.min(FH, Math.ceil(drawn[1])) - from;
+  if (H <= 0) return { y: 0, rows: 0, data: new ArrayBuffer(0) };
+  const img = ctx.getImageData(0, from, W, H);
   const rgba = img.data;
   const px = new Uint32Array(rgba.buffer, rgba.byteOffset, W * H);
   const blank = (y: number) => {
@@ -643,34 +1032,111 @@ export function lyricBand(ctx: OffscreenCanvasRenderingContext2D, W: number, H: 
   const V = out.subarray(n + (n >> 2), n + (n >> 1));
   const A = out.subarray(n + (n >> 1));
   const base = top * W * 4;
-  for (let i = 0; i < n; i++) {
-    const o = base + i * 4;
+  for (let i = 0, o = base; i < n; i++, o += 4) {
     const a = rgba[o + 3];
     A[i] = a;
-    Y[i] = a ? 16 + ((65.738 * rgba[o] + 129.057 * rgba[o + 1] + 25.064 * rgba[o + 2]) / 256 + 0.5) : 16;
+    // Integer BT.601 (as ffmpeg): no work at all where it's transparent.
+    Y[i] = a ? 16 + ((66 * rgba[o] + 129 * rgba[o + 1] + 25 * rgba[o + 2] + 128) >> 8) : 16;
   }
   // Chroma per 2×2 block, weighted by alpha (so transparent pixels don't grey the edges).
+  // (Plain index arithmetic: this runs for every frame, so no arrays per pixel.)
+  const stride = W * 4;
   for (let r = 0; r < rows; r += 2) {
-    for (let c = 0; c < cw; c++) {
-      let sa = 0, sr = 0, sg = 0, sb = 0;
-      for (const [dr, dc] of [[0, 0], [0, 1], [1, 0], [1, 1]]) {
-        const o = base + ((r + dr) * W + 2 * c + dc) * 4;
-        const a = rgba[o + 3];
-        sa += a;
-        sr += rgba[o] * a;
-        sg += rgba[o + 1] * a;
-        sb += rgba[o + 2] * a;
-      }
-      const k = (r >> 1) * cw + c;
-      if (!sa) {
+    let o = base + r * stride;
+    let k = (r >> 1) * cw;
+    for (let c = 0; c < cw; c++, o += 8, k++) {
+      const a0 = rgba[o + 3], a1 = rgba[o + 7], a2 = rgba[o + stride + 3], a3 = rgba[o + stride + 7];
+      const sa = a0 + a1 + a2 + a3;
+      if (sa === 0) {
         U[k] = 128;
         V[k] = 128;
         continue;
       }
-      const [R, G, B] = [sr / sa, sg / sa, sb / sa];
+      const R = (rgba[o] * a0 + rgba[o + 4] * a1 + rgba[o + stride] * a2 + rgba[o + stride + 4] * a3) / sa;
+      const G = (rgba[o + 1] * a0 + rgba[o + 5] * a1 + rgba[o + stride + 1] * a2 + rgba[o + stride + 5] * a3) / sa;
+      const B = (rgba[o + 2] * a0 + rgba[o + 6] * a1 + rgba[o + stride + 2] * a2 + rgba[o + stride + 6] * a3) / sa;
       U[k] = 128 + (-37.945 * R - 74.494 * G + 112.439 * B) / 256 + 0.5;
       V[k] = 128 + (112.439 * R - 94.154 * G - 18.285 * B) / 256 + 0.5;
     }
   }
-  return { y: top, rows, data: out.buffer };
+  return { y: from + top, rows, data: out.buffer };
+}
+
+/**
+ * Follow which rows of `ctx` (`H` high) get drawn on: every text, rectangle
+ * and path point marks its rows (through the current transform, with room
+ * for glows and outlines). `range()` gives the rows drawn since `reset()`,
+ * or null when nothing was.
+ */
+export function trackExtent(ctx: OffscreenCanvasRenderingContext2D, H: number) {
+  let lo = Infinity;
+  let hi = -Infinity;
+  const mark = (y0: number, y1: number) => {
+    const m = ctx.getTransform();
+    const room = ctx.shadowBlur * 2 + ctx.lineWidth + 6;
+    const [a, b] = [m.d * y0 + m.f, m.d * y1 + m.f];
+    lo = Math.min(lo, Math.min(a, b) - room);
+    hi = Math.max(hi, Math.max(a, b) + room);
+  };
+  const size = () => Number(/(\d+(?:\.\d+)?)px/.exec(ctx.font)?.[1] ?? 48);
+  const wrap = <K extends keyof OffscreenCanvasRenderingContext2D>(name: K, extent: (...args: number[]) => [number, number]) => {
+    const orig = (ctx[name] as (...a: unknown[]) => unknown).bind(ctx);
+    (ctx as unknown as Record<string, unknown>)[name] = (...args: unknown[]) => {
+      const nums = args.map((v) => (typeof v === "number" ? v : NaN));
+      mark(...extent(...nums));
+      return orig(...args);
+    };
+  };
+  // Text: from above the stacked Vietnamese accents to below the descenders.
+  const text = (_t: number, _x: number, y: number): [number, number] => [y - size() * 1.3, y + size() * 0.5];
+  wrap("fillText", text);
+  wrap("strokeText", text);
+  wrap("fillRect", (_x, y, _w, h) => [y, y + h]);
+  wrap("strokeRect", (_x, y, _w, h) => [y, y + h]);
+  wrap("roundRect", (_x, y, _w, h) => [y, y + h]);
+  wrap("arc", (_x, y, r) => [y - r, y + r]);
+  wrap("moveTo", (_x, y) => [y, y]);
+  wrap("lineTo", (_x, y) => [y, y]);
+  wrap("bezierCurveTo", (_a, y1, _b, y2, _x, y) => [Math.min(y1, y2, y), Math.max(y1, y2, y)]);
+  wrap("drawImage", () => [0, H]);
+  return {
+    reset() {
+      lo = Infinity;
+      hi = -Infinity;
+    },
+    range(): [number, number] | null {
+      return hi < lo ? null : [Math.max(0, lo), Math.min(H, hi)];
+    },
+  };
+}
+
+/** An opaque picture (`canvas`, even width and height) as yuv420p: planes Y, U, V; BT.601 limited, as `lyricBand`. */
+export function stillYuv(canvas: OffscreenCanvas): Uint8Array {
+  const W = canvas.width;
+  const H = canvas.height;
+  const rgba = canvas.getContext("2d")!.getImageData(0, 0, W, H).data;
+  const n = W * H;
+  const cw = W >> 1;
+  const out = new Uint8Array(n + (n >> 1));
+  const U = out.subarray(n, n + (n >> 2));
+  const V = out.subarray(n + (n >> 2));
+  for (let i = 0; i < n; i++) {
+    const o = i * 4;
+    out[i] = 16 + ((65.738 * rgba[o] + 129.057 * rgba[o + 1] + 25.064 * rgba[o + 2]) / 256 + 0.5);
+  }
+  for (let r = 0; r < H; r += 2) {
+    for (let c = 0; c < cw; c++) {
+      let R = 0, G = 0, B = 0;
+      for (const [dr, dc] of [[0, 0], [0, 1], [1, 0], [1, 1]]) {
+        const o = ((r + dr) * W + 2 * c + dc) * 4;
+        R += rgba[o];
+        G += rgba[o + 1];
+        B += rgba[o + 2];
+      }
+      const k = (r >> 1) * cw + c;
+      U[k] = 128 + (-37.945 * R - 74.494 * G + 112.439 * B) / 1024 + 0.5;
+      V[k] = 128 + (112.439 * R - 94.154 * G - 18.285 * B) / 1024 + 0.5;
+    }
+  }
+  return out;
 }
